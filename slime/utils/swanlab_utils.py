@@ -1,4 +1,5 @@
 import importlib
+import inspect
 import logging
 import os
 import threading
@@ -38,6 +39,18 @@ def _should_use_shared_parallel(args) -> bool:
     return mode in {None, "cloud"}
 
 
+def _filter_supported_kwargs(func, kwargs: dict[str, Any]) -> dict[str, Any]:
+    try:
+        parameters = inspect.signature(func).parameters
+    except (TypeError, ValueError):
+        return kwargs
+
+    if any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()):
+        return kwargs
+
+    return {key: value for key, value in kwargs.items() if key in parameters}
+
+
 def _maybe_login(args):
     if _is_offline_mode(args):
         return
@@ -49,11 +62,11 @@ def _maybe_login(args):
         return
 
     module = _require_swanlab()
-    try:
-        module.login(api_key=api_key, host=host, web_host=web_host, save=False)
-    except TypeError:
-        # Older SwanLab versions may not support save=.
-        module.login(api_key=api_key, host=host, web_host=web_host)
+    login_kwargs = _filter_supported_kwargs(
+        module.login,
+        {"api_key": api_key, "host": host, "web_host": web_host, "save": False},
+    )
+    module.login(**login_kwargs)
 
 
 def _generate_id() -> str:

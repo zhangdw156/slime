@@ -138,6 +138,47 @@ def test_swanlab_primary_and_secondary_init_share_run_id(monkeypatch):
     assert init_calls[1]["resume"] == "allow"
 
 
+def test_swanlab_login_omits_unsupported_web_host_kwarg(monkeypatch):
+    import slime.utils.swanlab_utils as swanlab_utils
+
+    login_calls = []
+
+    def login(api_key=None, host=None, save=False, timeout=10):
+        login_calls.append({"api_key": api_key, "host": host, "save": save, "timeout": timeout})
+
+    init_calls = []
+    swanlab_stub = SimpleNamespace(
+        login=login,
+        init=lambda **kwargs: init_calls.append(kwargs) or SimpleNamespace(id=kwargs["id"]),
+        get_run=lambda: SimpleNamespace(id="active-run"),
+        util=SimpleNamespace(generate_id=lambda: "generated-id"),
+    )
+    monkeypatch.setattr(swanlab_utils, "swanlab", swanlab_stub)
+
+    args = SimpleNamespace(
+        use_swanlab=True,
+        use_wandb=False,
+        swanlab_mode="cloud",
+        swanlab_key="secret",
+        swanlab_host="https://api.swanlab.cn",
+        swanlab_web_host="https://swanlab.cn",
+        swanlab_workspace="workspace",
+        swanlab_project="project",
+        swanlab_group="group",
+        swanlab_experiment_name=None,
+        swanlab_dir=None,
+        swanlab_random_suffix=False,
+        swanlab_run_id=None,
+    )
+
+    swanlab_utils.init_swanlab_primary(args)
+
+    assert login_calls == [
+        {"api_key": "secret", "host": "https://api.swanlab.cn", "save": False, "timeout": 10}
+    ]
+    assert init_calls[0]["project"] == "project"
+
+
 def test_swanlab_log_removes_step_and_uses_explicit_step(monkeypatch):
     import slime.utils.swanlab_utils as swanlab_utils
 
