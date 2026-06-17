@@ -118,6 +118,34 @@ WANDB_ARGS=(
    # --wandb-key ${WANDB_KEY}
 )
 
+SWANLAB_ARGS=(
+   --use-swanlab
+   --swanlab-mode "${SWANLAB_MODE:-cloud}"
+   --swanlab-project "${SWANLAB_PROJECT:-slime-alfworld}"
+   --swanlab-group "${SWANLAB_GROUP:-qwen2.5-3B-instruct}"
+   --swanlab-experiment-name "${SWANLAB_EXPERIMENT_NAME:-qwen2.5-3B-instruct-alfworld}"
+   --disable-swanlab-random-suffix
+)
+
+if [[ -n "${SWANLAB_API_KEY:-}" ]]; then
+   SWANLAB_ARGS+=(--swanlab-key "${SWANLAB_API_KEY}")
+fi
+if [[ -n "${SWANLAB_WORKSPACE:-}" ]]; then
+   SWANLAB_ARGS+=(--swanlab-workspace "${SWANLAB_WORKSPACE}")
+fi
+if [[ -n "${SWANLAB_DIR:-}" ]]; then
+   SWANLAB_ARGS+=(--swanlab-dir "${SWANLAB_DIR}")
+fi
+if [[ -n "${SWANLAB_HOST:-}" ]]; then
+   SWANLAB_ARGS+=(--swanlab-host "${SWANLAB_HOST}")
+fi
+if [[ -n "${SWANLAB_WEB_HOST:-}" ]]; then
+   SWANLAB_ARGS+=(--swanlab-web-host "${SWANLAB_WEB_HOST}")
+fi
+if [[ -n "${SWANLAB_OPEN_METRICS_INTERVAL:-}" ]]; then
+   SWANLAB_ARGS+=(--swanlab-open-metrics-interval "${SWANLAB_OPEN_METRICS_INTERVAL}")
+fi
+
 SGLANG_ARGS=(
    --rollout-num-gpus-per-engine 1
    --sglang-mem-fraction-static 0.7
@@ -166,6 +194,7 @@ ray job submit --address="http://127.0.0.1:8265" \
    "${GRPO_ARGS[@]}" \
    "${DISTRIBUTED_ARGS[@]}" \
    "${WANDB_ARGS[@]}" \
+   "${SWANLAB_ARGS[@]}" \
    "${PERF_ARGS[@]}" \
    "${EVAL_ARGS[@]}" \
    "${SGLANG_ARGS[@]}" \
