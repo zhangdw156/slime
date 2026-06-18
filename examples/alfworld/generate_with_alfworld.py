@@ -16,7 +16,7 @@ from collections import defaultdict
 from typing import Any, Iterable
 
 from alfworld_env import AlfWorldTextEpisode
-from prompts import ALFWORLD_SYSTEM_PROMPT, build_observation_prompt, extract_task, parse_action
+from prompts import ALFWORLD_SYSTEM_PROMPT, _task_description_from_reset, build_observation_prompt, parse_action
 
 from slime.rollout.filter_hub.base_types import DynamicFilterOutput
 from slime.rollout.sglang_rollout import GenerateState
@@ -229,7 +229,7 @@ async def generate(
 
     with AlfWorldTextEpisode(config_path, split=env_split, gamefile=gamefile, seed=seed) as episode:
         reset_result = episode.reset()
-        task_description = metadata.get("task_type") or extract_task(reset_result.observation)
+        task_description = _task_description_from_reset(reset_result.observation)
         history: list[dict[str, str]] = []
         current_observation = reset_result.observation
         admissible_actions = reset_result.admissible_actions

@@ -58,6 +58,19 @@ def extract_task(observation: str) -> str:
     return observation[start + len(_TASK_PREFIX) :].strip()
 
 
+def _task_description_from_reset(reset_observation: str) -> str:
+    """Return the natural-language ALFWorld goal for subsequent turns.
+
+    ``metadata["task_type"]`` is only a coarse ALFWorld category such as
+    ``pick_two_obj_and_place``.  The reset observation must contain the real
+    natural-language task goal; fail fast if it does not.
+    """
+    task = extract_task(reset_observation).strip()
+    if not task:
+        raise ValueError("ALFWorld reset observation did not contain a task goal.")
+    return task
+
+
 def format_admissible_actions(actions: list[str]) -> str:
     """Format ALFWorld admissible commands for prompt insertion."""
     return "\n ".join(f"'{action}'" for action in actions if action != "help")

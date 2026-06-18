@@ -40,7 +40,7 @@ from generate_with_alfworld import (
     _router_headers,
     _safe_action_for_env,
 )
-from prompts import extract_task, parse_action
+from prompts import _task_description_from_reset, parse_action
 
 from slime.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput
 from slime.rollout.filter_hub.base_types import MetricGatherer, call_dynamic_filter
@@ -402,7 +402,7 @@ async def _run_batched_episodes(
     reset_time = time.perf_counter() - reset_start
     for trajectory, reset_result in zip(trajectories, reset_results, strict=True):
         trajectory.env_time += reset_time / max(1, len(trajectories))
-        trajectory.task_description = trajectory.metadata.get("task_type") or extract_task(reset_result.observation)
+        trajectory.task_description = _task_description_from_reset(reset_result.observation)
         trajectory.current_observation = reset_result.observation
         trajectory.admissible_actions = reset_result.admissible_actions
         trajectory.last_info = reset_result.info
