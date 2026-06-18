@@ -179,6 +179,22 @@ def _final_episode_metadata(
     }
 
 
+def _set_eval_episode_token_fields(sample: Sample, response_tokens: list[int]) -> None:
+    """Populate eval metrics from generated assistant/action tokens only.
+
+    An ALFWorld eval sample summarizes a whole episode with many per-step
+    prompts, so there is no single prompt prefix that can be prepended while
+    keeping all assistant tokens as one contiguous response suffix. Store only
+    generated assistant tokens here; eval logging uses
+    ``Sample.effective_response_length`` (``sum(loss_mask)``) for response_len
+    metrics, and the all-ones mask makes that value equal the actual generated
+    action-token count.
+    """
+    sample.tokens = list(response_tokens)
+    sample.response_length = len(response_tokens)
+    sample.loss_mask = [1] * sample.response_length
+
+
 async def generate(
     args: Namespace,
     sample: Sample,
@@ -219,6 +235,7 @@ async def generate(
 
     step_samples: list[Sample] = []
     assistant_responses: list[str] = []
+    assistant_response_tokens: list[int] = []
     trajectory: list[dict[str, Any]] = []
     invalid_action_count = 0
     total_reward = 0.0
@@ -265,13 +282,13 @@ async def generate(
             if finish_type == "abort":
                 aborted = True
                 break
-
             response = output.get("text", "")
             if response.endswith("<|im_end|>"):
                 response = response[: -len("<|im_end|>")]
 
             response_tokens, response_log_probs = _response_tokens_and_logprobs(tokenizer, response, meta_info)
             assistant_responses.append(response)
+            assistant_response_tokens.extend(response_tokens)
 
             parsed = parse_action(response, admissible_actions)
             env_action = _safe_action_for_env(parsed.action, admissible_actions)
@@ -342,9 +359,8 @@ async def generate(
     )
 
     if evaluation:
-        # TODO: Populate response_length/loss_mask/tokens for eval summaries so
-        # eval response_len metrics reflect generated ALFWorld action tokens.
         sample.response = "\n".join(assistant_responses)
+        _set_eval_episode_token_fields(sample, assistant_response_tokens)
         sample.reward = final_reward
         sample.status = Sample.Status.ABORTED if aborted else (Sample.Status.COMPLETED if done else Sample.Status.TRUNCATED)
         sample.metadata = episode_metadata

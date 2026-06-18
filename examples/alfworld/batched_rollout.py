@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import logging
+import math
 import time
 import uuid
 from argparse import Namespace
@@ -465,6 +466,80 @@ def _flatten_prompt_groups(prompt_groups: list[list[Sample]]) -> list[Sample]:
     return [sample for group in prompt_groups for sample in group]
 
 
+def _coerce_alfworld_won(value: Any) -> bool | None:
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        numeric_value = float(value)
+        if not math.isfinite(numeric_value):
+            return None
+        return bool(numeric_value)
+    return None
+
+
+def _metric_key_part(value: Any) -> str:
+    text = str(value).strip() if value is not None else "unknown"
+    if not text:
+        return "unknown"
+    return "_".join(text.replace("/", " ").split()) or "unknown"
+
+
+def _add_alfworld_success_metrics(
+    metrics: dict[str, Any],
+    prefix: str,
+    samples: list[Sample],
+) -> None:
+    """Add episode-level ALFWorld success metrics under a tracker prefix.
+
+    ``episode_count`` is the denominator for success-rate metrics and counts
+    only samples with a usable ``metadata["alfworld"]["won"]`` value.
+    Missing or malformed metadata is counted separately instead of being
+    silently treated as success or failure.
+    """
+    episode_count = 0
+    success_count = 0
+    missing_won_count = 0
+    by_task_type: dict[str, dict[str, int]] = {}
+
+    for sample in samples:
+        metadata = getattr(sample, "metadata", None)
+        if not isinstance(metadata, dict):
+            missing_won_count += 1
+            continue
+
+        alfworld_metadata = metadata.get("alfworld")
+        if not isinstance(alfworld_metadata, dict):
+            missing_won_count += 1
+            continue
+
+        won = _coerce_alfworld_won(alfworld_metadata.get("won"))
+        if won is None:
+            missing_won_count += 1
+            continue
+
+        task_type = _metric_key_part(metadata.get("task_type"))
+        bucket = by_task_type.setdefault(task_type, {"success_count": 0, "episode_count": 0})
+        episode_count += 1
+        bucket["episode_count"] += 1
+        if won:
+            success_count += 1
+            bucket["success_count"] += 1
+
+    metrics[f"{prefix}/alfworld/sample_count"] = len(samples)
+    metrics[f"{prefix}/alfworld/episode_count"] = episode_count
+    metrics[f"{prefix}/alfworld/success_count"] = success_count
+    metrics[f"{prefix}/alfworld/missing_won_count"] = missing_won_count
+    if episode_count > 0:
+        metrics[f"{prefix}/alfworld/success_rate"] = success_count / episode_count
+
+    for task_type, counts in sorted(by_task_type.items()):
+        task_episode_count = counts["episode_count"]
+        task_prefix = f"{prefix}/alfworld/task_type/{task_type}"
+        metrics[f"{task_prefix}/episode_count"] = task_episode_count
+        metrics[f"{task_prefix}/success_count"] = counts["success_count"]
+        metrics[f"{task_prefix}/success_rate"] = counts["success_count"] / task_episode_count
+
+
 async def _generate_train_rollout(args: Namespace, rollout_id: int, data_source: Any) -> RolloutFnTrainOutput:
     assert args.rollout_global_dataset
 
@@ -550,6 +625,8 @@ async def _generate_eval_rollout(args: Namespace, rollout_id: int) -> RolloutFnE
 
     generate_state = GenerateState(args)
     results: dict[str, dict[str, Any]] = {}
+    metrics: dict[str, Any] = {}
+    all_eval_samples: list[Sample] = []
     reward_key = args.eval_reward_key or args.reward_key
     eval_batch_size = _get_int_env(
         "ALFWORLD_EVAL_BATCH_SIZE",
@@ -603,6 +680,8 @@ async def _generate_eval_rollout(args: Namespace, rollout_id: int) -> RolloutFnE
         pbar.close()
 
         data.sort(key=lambda sample: sample.index)
+        _add_alfworld_success_metrics(metrics, f"eval/{dataset_cfg.name}", data)
+        all_eval_samples.extend(data)
         if data:
             logger.info(
                 "Batched ALFWorld eval %s example: %s reward=%s",
@@ -610,16 +689,21 @@ async def _generate_eval_rollout(args: Namespace, rollout_id: int) -> RolloutFnE
                 [str(data[0].prompt) + data[0].response],
                 data[0].reward,
             )
+        else:
+            logger.warning(
+                "Batched ALFWorld eval %s produced no samples; skipping default reward metrics for this dataset.",
+                dataset_cfg.name,
+            )
+            continue
         results[dataset_cfg.name] = {
             "rewards": [sample.reward if not reward_key else sample.reward[reward_key] for sample in data],
             "truncated": [sample.status == Sample.Status.TRUNCATED for sample in data],
             "samples": data,
         }
 
-    # TODO: Aggregate ALFWorld eval success rates from sample.metadata["alfworld"]["won"]
-    # and metadata["task_type"], then return them via RolloutFnEvalOutput.metrics so
-    # SwanLab can show SDAR-style per-task success-rate curves.
-    return RolloutFnEvalOutput(data=results)
+    _add_alfworld_success_metrics(metrics, "eval", all_eval_samples)
+
+    return RolloutFnEvalOutput(data=results, metrics=metrics)
 
 
 def generate_rollout(
