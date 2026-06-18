@@ -616,6 +616,9 @@ async def _generate_eval_rollout(args: Namespace, rollout_id: int) -> RolloutFnE
             "samples": data,
         }
 
+    # TODO: Aggregate ALFWorld eval success rates from sample.metadata["alfworld"]["won"]
+    # and metadata["task_type"], then return them via RolloutFnEvalOutput.metrics so
+    # SwanLab can show SDAR-style per-task success-rate curves.
     return RolloutFnEvalOutput(data=results)
 
 
