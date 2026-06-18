@@ -1,6 +1,6 @@
 # ALFWorld GRPO
 
-This example trains `Qwen2.5-3B-Instruct` with slime GRPO in the ALFWorld TextWorld environment. It follows the same slime integration pattern as `examples/tau-bench`: the default slime rollout loop is kept, while `--custom-generate-function-path generate_with_alfworld.generate` runs a complete agent-environment episode and returns a trainable `Sample`.
+This example trains `Qwen2.5-3B-Instruct` with slime GRPO in the ALFWorld TextWorld environment. It uses `--rollout-function-path batched_rollout.generate_rollout` so one rollout batch can coordinate many active agent-environment episodes: model action requests are issued concurrently per environment step, and ALFWorld environment state is kept in Ray actors.
 
 This example is intended to reproduce the ALFWorld GRPO experiment from the SDAR paper [Self-Distilled Agentic Reinforcement Learning](https://arxiv.org/abs/2605.15155) by Meituan and Zhejiang University. It keeps the objective as plain GRPO so the run can serve as the paper's GRPO baseline before adding SDAR/OPSD privileged distillation losses.
 
@@ -50,7 +50,7 @@ The output files are:
 /root/slime-alfworld/valid_unseen_games.jsonl
 ```
 
-Each row stores an `index` prompt plus `metadata.gamefile`; the custom generator uses the gamefile to load the actual ALFWorld episode.
+Each row stores an `index` prompt plus `metadata.gamefile`; the rollout function uses the gamefile to load the actual ALFWorld episode.
 
 ## 4. Run GRPO
 
@@ -67,6 +67,7 @@ ROLLOUT_BATCH_SIZE=16 N_SAMPLES_PER_PROMPT=8 \
 ALFWORLD_TASK_DIR=/root/slime-alfworld \
 ALFWORLD_DATA=/root/.cache/alfworld \
 ALFWORLD_STEP_MAX_TOKENS=512 \
+ALFWORLD_ENV_WORKER_CPUS=0.1 \
 ALFWORLD_MAX_STEPS=50 \
 bash examples/alfworld/run_qwen2.5_3B_instruct.sh
 ```
@@ -74,7 +75,8 @@ bash examples/alfworld/run_qwen2.5_3B_instruct.sh
 ## How the example works
 
 - `prepare_alfworld_data.py` scans `$ALFWORLD_DATA/json_2.1.1/{train,valid_seen,valid_unseen}` and keeps solvable `game.tw-pddl` tasks.
-- `generate_with_alfworld.py` resets one `AlfredTWEnv` episode, prompts the model with the current observation and admissible actions, parses `<think>...</think><action>...</action>`, steps the environment, and returns a slime `Sample`.
+- `batched_rollout.py` resets one `AlfredTWEnv` episode per trajectory in Ray actors, prompts the model with the current observation and admissible actions, parses `<think>...</think><action>...</action>`, steps all active environments in parallel, and returns step-level slime `Sample` objects.
+- `generate_with_alfworld.py` keeps the single-episode fallback implementation plus shared reward/filter/helper functions used by the batched rollout path.
 - The reward is `1 * won - ALFWORLD_INVALID_ACTION_PENALTY * invalid_action_count`; the default invalid-action penalty is `0.01`.
 - `loss_mask` is `1` only on assistant-generated tokens and `0` on environment/user-observation tokens.
 - The training objective is plain GRPO. This example does **not** add SDAR/OPSD privileged teacher loss; that should be a later custom-loss extension.
@@ -84,7 +86,8 @@ bash examples/alfworld/run_qwen2.5_3B_instruct.sh
 | File | Purpose |
 | --- | --- |
 | `run_qwen2.5_3B_instruct.sh` | slime launch script for Qwen2.5-3B-Instruct GRPO |
-| `generate_with_alfworld.py` | custom per-sample ALFWorld rollout function |
+| `batched_rollout.py` | custom batched ALFWorld rollout function used by `--rollout-function-path` |
+| `generate_with_alfworld.py` | single-episode fallback plus reward/filter/helper functions |
 | `alfworld_env.py` | lazy ALFWorld TextWorld episode wrapper |
 | `prompts.py` | ALFWorld prompt templates and action parser |
 | `prepare_alfworld_data.py` | builds JSONL task indices from ALFWorld data |
