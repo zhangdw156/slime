@@ -342,6 +342,8 @@ async def generate(
     )
 
     if evaluation:
+        # TODO: Populate response_length/loss_mask/tokens for eval summaries so
+        # eval response_len metrics reflect generated ALFWorld action tokens.
         sample.response = "\n".join(assistant_responses)
         sample.reward = final_reward
         sample.status = Sample.Status.ABORTED if aborted else (Sample.Status.COMPLETED if done else Sample.Status.TRUNCATED)
