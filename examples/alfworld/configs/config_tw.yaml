@@ -40,7 +40,7 @@ general:
   use_cuda: True
   visdom: False
   task: 'alfred'
-  training_method: 'dagger'
+  training_method: 'dqn'
   save_path: './training/'
   observation_pool_capacity: 3
   hide_init_receptacles: False
