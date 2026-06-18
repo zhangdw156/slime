@@ -54,6 +54,24 @@ def _first(value):
     return value
 
 
+def _pin_config_to_gamefile(config: dict[str, Any], split: str, gamefile: Path) -> None:
+    """Limit ALFWorld's dataset scan to the selected game directory."""
+    dataset = config.setdefault("dataset", {})
+    game_root = str(gamefile.parent)
+
+    if split == "train":
+        dataset["data_path"] = game_root
+        dataset["num_train_games"] = 1
+    elif split == "eval_in_distribution":
+        dataset["eval_id_data_path"] = game_root
+        dataset["num_eval_games"] = 1
+    elif split == "eval_out_of_distribution":
+        dataset["eval_ood_data_path"] = game_root
+        dataset["num_eval_games"] = 1
+    else:
+        raise ValueError(f"Unsupported ALFWorld split: {split!r}.")
+
+
 class AlfWorldTextEpisode:
     """Run one ALFWorld TextWorld episode, optionally pinned to one game file."""
 
@@ -93,15 +111,18 @@ class AlfWorldTextEpisode:
         if env_type != "AlfredTWEnv":
             raise ValueError(f"Only AlfredTWEnv text mode is supported by this example, got {env_type!r}.")
 
-        self._base_env = get_environment(env_type)(config, train_eval=self.split)
+        pinned_gamefile = None
         if self.gamefile:
-            gamefile = os.path.expandvars(os.path.expanduser(self.gamefile))
-            if not Path(gamefile).exists():
-                raise FileNotFoundError(f"ALFWorld gamefile does not exist: {gamefile}")
-            # Pin this episode to the dataset row selected by slime. AlfredTWEnv
-            # collects all games in __init__, but init_env() reads self.game_files,
-            # so replacing it before init_env keeps the game source explicit.
-            self._base_env.game_files = [gamefile]
+            pinned_gamefile = Path(os.path.expandvars(os.path.expanduser(self.gamefile)))
+            if not pinned_gamefile.exists():
+                raise FileNotFoundError(f"ALFWorld gamefile does not exist: {pinned_gamefile}")
+            _pin_config_to_gamefile(config, self.split, pinned_gamefile)
+
+        self._base_env = get_environment(env_type)(config, train_eval=self.split)
+        if pinned_gamefile is not None:
+            # Keep an explicit pin as a guard even though the config now points to
+            # the selected game directory before AlfredTWEnv scans the dataset.
+            self._base_env.game_files = [str(pinned_gamefile)]
             self._base_env.num_games = 1
 
         self._env = self._base_env.init_env(batch_size=1)
