@@ -41,7 +41,7 @@ export ALFWORLD_INVALID_ACTION_PENALTY=${ALFWORLD_INVALID_ACTION_PENALTY:-0.01}
 
 ROLLOUT_BATCH_SIZE=${ROLLOUT_BATCH_SIZE:-16}
 N_SAMPLES_PER_PROMPT=${N_SAMPLES_PER_PROMPT:-8}
-GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-256}
+GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-$((ROLLOUT_BATCH_SIZE * N_SAMPLES_PER_PROMPT))}
 NUM_ROLLOUT=${NUM_ROLLOUT:-200}
 NUM_GPUS=${NUM_GPUS:-4}
 TP_SIZE=${TP_SIZE:-1}
@@ -66,7 +66,8 @@ ROLLOUT_ARGS=(
    --rollout-max-response-len "${ALFWORLD_STEP_MAX_TOKENS}"
    --rollout-temperature 1
    --global-batch-size "${GLOBAL_BATCH_SIZE}"
-   --dynamic-sampling-filter-path slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std
+   --dynamic-sampling-filter-path generate_with_alfworld.check_episode_reward_nonzero_std
+   --custom-reward-post-process-path generate_with_alfworld.grpo_normalize_alfworld_steps
    --balance-data
 )
 
