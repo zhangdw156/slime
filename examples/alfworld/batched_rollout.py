@@ -41,6 +41,7 @@ from generate_with_alfworld import (
     _router_headers,
     _safe_action_for_env,
 )
+from opsd import annotate_opsd_teacher_log_probs, ensure_opsd_teacher_log_probs, opsd_enabled
 from prompts import _task_description_from_reset, parse_action
 
 from slime.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput
@@ -239,7 +240,7 @@ def _record_step_sample(
     result: dict[str, Any],
     step_result: StepResult,
     max_steps: int,
-) -> None:
+) -> Sample | None:
     sample = trajectory.sample
     step_id = result["step_id"]
     parsed = result["parsed_action"]
@@ -276,6 +277,7 @@ def _record_step_sample(
         step_sample.response = result["response"]
         step_sample.response_length = len(response_tokens)
         step_sample.loss_mask = [1] * len(response_tokens)
+        step_sample.session_id = sample.session_id
         step_sample.status = Sample.Status.TRUNCATED if result["finish_type"] == "length" else Sample.Status.COMPLETED
         if result["response_log_probs"] is not None and len(result["response_log_probs"]) == len(response_tokens):
             step_sample.rollout_log_probs = result["response_log_probs"]
@@ -297,14 +299,19 @@ def _record_step_sample(
             "alfworld_step": step_record,
         }
         trajectory.step_samples.append(step_sample)
+    else:
+        step_sample = None
 
     if not step_result.done:
         trajectory.history.append({"observation": trajectory.current_observation, "action": result["env_action"]})
         trajectory.current_observation = step_result.observation
         trajectory.admissible_actions = step_result.admissible_actions
 
+    return step_sample
+
 
 def _finalize_trajectory(
+    args: Namespace,
     generate_state: GenerateState,
     trajectory: TrajectoryState,
     invalid_action_penalty: float,
@@ -338,7 +345,9 @@ def _finalize_trajectory(
 
     if not trajectory.step_samples:
         reason = "sglang_abort" if trajectory.aborted else "empty_episode_response"
-        return [_make_placeholder_step_sample(trajectory.sample, generate_state.tokenizer, episode_metadata, reason)]
+        placeholder = _make_placeholder_step_sample(trajectory.sample, generate_state.tokenizer, episode_metadata, reason)
+        ensure_opsd_teacher_log_probs(args, [placeholder])
+        return [placeholder]
 
     if any(step_sample.rollout_log_probs is None for step_sample in trajectory.step_samples):
         for step_sample in trajectory.step_samples:
@@ -352,6 +361,8 @@ def _finalize_trajectory(
             "turn_step": step_sample.metadata["turn_step"],
             "alfworld_step": step_sample.metadata["alfworld_step"],
         }
+
+    ensure_opsd_teacher_log_probs(args, trajectory.step_samples)
 
     return trajectory.step_samples
 
@@ -445,6 +456,7 @@ async def _run_batched_episodes(
         step_results = ray.get(step_refs)
         step_time = time.perf_counter() - step_start
         per_trajectory_step_time = step_time / max(1, len(step_items))
+        step_samples: list[Sample] = []
         for result, step_result in zip(step_items, step_results, strict=True):
             trajectory = result["trajectory"]
             previous_env_time = trajectory.env_time
@@ -452,9 +464,14 @@ async def _run_batched_episodes(
             result["non_generation_time"] = (
                 trajectory.env_time if result["step_id"] == 0 else trajectory.env_time - previous_env_time
             )
-            _record_step_sample(args, trajectory, result, step_result, max_steps)
+            step_sample = _record_step_sample(args, trajectory, result, step_result, max_steps)
+            if step_sample is not None:
+                step_samples.append(step_sample)
 
-    return [_finalize_trajectory(generate_state, trajectory, invalid_action_penalty) for trajectory in trajectories]
+        if not evaluation and step_samples and opsd_enabled(args):
+            await annotate_opsd_teacher_log_probs(args, generate_state.tokenizer, step_samples)
+
+    return [_finalize_trajectory(args, generate_state, trajectory, invalid_action_penalty) for trajectory in trajectories]
 
 
 def _first_sample(group: list[Sample | list[Sample]]) -> Sample:

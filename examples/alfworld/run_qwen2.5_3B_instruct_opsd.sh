@@ -1,14 +1,18 @@
 #!/bin/bash
 
-# for rerun the task
-pkill -9 sglang || true
-sleep 3
-ray stop --force || true
-pkill -9 ray || true
-pkill -9 python || true
-sleep 3
-pkill -9 ray || true
-pkill -9 python || true
+# Optional destructive cleanup for dedicated nodes only.  It is disabled by
+# default because broad pkill/ray stop can kill unrelated jobs on shared servers.
+if [[ "${ALFWORLD_FORCE_CLEANUP:-0}" == "1" ]]; then
+   echo "ALFWORLD_FORCE_CLEANUP=1: stopping local Ray/SGLang/Python processes before launch."
+   pkill -9 sglang || true
+   sleep 3
+   ray stop --force || true
+   pkill -9 ray || true
+   pkill -9 python || true
+   sleep 3
+   pkill -9 ray || true
+   pkill -9 python || true
+fi
 
 set -ex
 
@@ -30,7 +34,7 @@ source "${SCRIPT_DIR}/../../scripts/models/qwen2.5-3B.sh"
 
 MODEL_ROOT=${MODEL_ROOT:-/root/Qwen2.5-3B-Instruct}
 MCORE_CKPT=${MCORE_CKPT:-/root/Qwen2.5-3B-Instruct_torch_dist}
-SLIME_CKPT=${SLIME_CKPT:-/root/Qwen2.5-3B-Instruct_alfworld_slime}
+SLIME_CKPT=${SLIME_CKPT:-/root/Qwen2.5-3B-Instruct_alfworld_opsd_slime}
 ALFWORLD_TASK_DIR=${ALFWORLD_TASK_DIR:-/root/slime-alfworld}
 export ALFWORLD_DATA=${ALFWORLD_DATA:-/root/.cache/alfworld}
 export ALFWORLD_CONFIG_PATH=${ALFWORLD_CONFIG_PATH:-${SCRIPT_DIR}/configs/config_tw.yaml}
@@ -39,6 +43,14 @@ export ALFWORLD_HISTORY_LENGTH=${ALFWORLD_HISTORY_LENGTH:-4}
 export ALFWORLD_STEP_MAX_TOKENS=${ALFWORLD_STEP_MAX_TOKENS:-512}
 export ALFWORLD_INVALID_ACTION_PENALTY=${ALFWORLD_INVALID_ACTION_PENALTY:-0.01}
 export ALFWORLD_ENV_WORKER_CPUS=${ALFWORLD_ENV_WORKER_CPUS:-0.1}
+export ALFWORLD_OPSD_SKILLS_DIR=${ALFWORLD_OPSD_SKILLS_DIR:-${SCRIPT_DIR}/skills}
+export ALFWORLD_OPSD_SKILL_ALL=${ALFWORLD_OPSD_SKILL_ALL:-false}
+export ALFWORLD_OPSD_TEACHER_CONCURRENCY=${ALFWORLD_OPSD_TEACHER_CONCURRENCY:-64}
+# Default OPSD mode is self: score privileged prompts on slime's current
+# rollout SGLang router. For an external SGLang teacher, set OPSD_TYPE=sglang
+# and ALFWORLD_OPSD_TEACHER_URL=http://teacher-host:port/generate.
+export ALFWORLD_OPSD_TEACHER_URL=${ALFWORLD_OPSD_TEACHER_URL:-}
+export ALFWORLD_OPSD_MAX_PROMPT_TOKENS=${ALFWORLD_OPSD_MAX_PROMPT_TOKENS:-}
 
 ROLLOUT_BATCH_SIZE=${ROLLOUT_BATCH_SIZE:-16}
 N_SAMPLES_PER_PROMPT=${N_SAMPLES_PER_PROMPT:-8}
@@ -47,6 +59,8 @@ NUM_ROLLOUT=${NUM_ROLLOUT:-200}
 NUM_GPUS=${NUM_GPUS:-4}
 TP_SIZE=${TP_SIZE:-1}
 MAX_TOKENS_PER_GPU=${MAX_TOKENS_PER_GPU:-12288}
+OPSD_KL_COEF=${OPSD_KL_COEF:-0.01}
+OPSD_TYPE=${OPSD_TYPE:-self}
 
 CKPT_ARGS=(
    --hf-checkpoint "${MODEL_ROOT}/"
@@ -67,8 +81,10 @@ ROLLOUT_ARGS=(
    --rollout-max-response-len "${ALFWORLD_STEP_MAX_TOKENS}"
    --rollout-temperature 1
    --global-batch-size "${GLOBAL_BATCH_SIZE}"
-   --dynamic-sampling-filter-path generate_with_alfworld.check_episode_reward_nonzero_std
-   --custom-reward-post-process-path generate_with_alfworld.grpo_normalize_alfworld_steps
+   # Pure OPSD keeps environment rewards only as raw metrics; the processed
+   # training reward is zeroed so the OPD term is the only policy signal.
+   # Do not enable the GRPO reward-std dynamic filter here.
+   --custom-reward-post-process-path generate_with_alfworld.zero_alfworld_rewards_for_opsd
    --balance-data
 )
 
@@ -96,12 +112,14 @@ PERF_ARGS=(
 
 GRPO_ARGS=(
    --advantage-estimator grpo
-   --use-kl-loss
-   --kl-loss-coef 0.01
-   --kl-loss-type low_var_kl
+   # Keep pure OPSD free of reference KL loss/forwarding; the OPD advantage
+   # penalty is the only policy signal because processed rewards are zero.
    --entropy-coef 0.00
    --eps-clip 0.2
    --eps-clip-high 0.28
+   --use-opd
+   --opd-type "${OPSD_TYPE}"
+   --opd-kl-coef "${OPSD_KL_COEF}"
 )
 
 OPTIMIZER_ARGS=(
@@ -125,7 +143,7 @@ SWANLAB_ARGS=(
    --swanlab-mode "${SWANLAB_MODE:-cloud}"
    --swanlab-project "${SWANLAB_PROJECT:-slime-alfworld}"
    --swanlab-group "${SWANLAB_GROUP:-qwen2.5-3B-instruct}"
-   --swanlab-experiment-name "${SWANLAB_EXPERIMENT_NAME:-qwen2.5-3B-instruct-alfworld}"
+   --swanlab-experiment-name "${SWANLAB_EXPERIMENT_NAME:-qwen2.5-3B-instruct-alfworld-opsd}"
    --disable-swanlab-random-suffix
 )
 
@@ -179,7 +197,12 @@ RUNTIME_ENV_JSON="{
     \"ALFWORLD_HISTORY_LENGTH\": \"${ALFWORLD_HISTORY_LENGTH}\",
     \"ALFWORLD_STEP_MAX_TOKENS\": \"${ALFWORLD_STEP_MAX_TOKENS}\",
     \"ALFWORLD_INVALID_ACTION_PENALTY\": \"${ALFWORLD_INVALID_ACTION_PENALTY}\",
-    \"ALFWORLD_ENV_WORKER_CPUS\": \"${ALFWORLD_ENV_WORKER_CPUS}\"
+    \"ALFWORLD_ENV_WORKER_CPUS\": \"${ALFWORLD_ENV_WORKER_CPUS}\",
+    \"ALFWORLD_OPSD_SKILLS_DIR\": \"${ALFWORLD_OPSD_SKILLS_DIR}\",
+    \"ALFWORLD_OPSD_SKILL_ALL\": \"${ALFWORLD_OPSD_SKILL_ALL}\",
+    \"ALFWORLD_OPSD_TEACHER_CONCURRENCY\": \"${ALFWORLD_OPSD_TEACHER_CONCURRENCY}\",
+    \"ALFWORLD_OPSD_TEACHER_URL\": \"${ALFWORLD_OPSD_TEACHER_URL}\",
+    \"ALFWORLD_OPSD_MAX_PROMPT_TOKENS\": \"${ALFWORLD_OPSD_MAX_PROMPT_TOKENS}\"
   }
 }"
 

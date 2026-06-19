@@ -5,18 +5,19 @@ This example shows how to run **on-policy distillation (OPD)** using slime. A sm
 ## Key Features
 
 - **OPD is orthogonal to advantage estimators**: OPD works as an additive KL penalty on top of any advantage estimator (GRPO, PPO, REINFORCE++, etc.), not as a separate estimator.
-- **Two teacher modes**:
+- **Three teacher modes**:
   - **sglang**: Teacher runs on an external SGLang server, teacher log-probs are obtained during rollout.
   - **megatron**: Teacher is loaded directly into Megatron via `--opd-teacher-load`, teacher log-probs are computed during training forward pass.
+  - **self**: A custom rollout path supplies teacher log-probs, typically by scoring the current rollout model/router under a privileged prompt.
 
 ## Key Arguments
 
 | Argument | Description |
 |----------|-------------|
 | `--use-opd` | Enable on-policy distillation. Required flag to use OPD. |
-| `--opd-type` | Type of OPD: `sglang` or `megatron`. Required when `--use-opd` is set. |
+| `--opd-type` | Type of OPD: `sglang`, `megatron`, or `self`. Required when `--use-opd` is set. |
 | `--opd-kl-coef` | OPD KL penalty coefficient (default: 1.0). |
-| `--opd-teacher-load` | Path to teacher checkpoint. **Required** when `--opd-type=megatron`, **must not be set** when `--opd-type=sglang`. |
+| `--opd-teacher-load` | Path to teacher checkpoint. **Required** when `--opd-type=megatron`, **must not be set** when `--opd-type=sglang` or `self`. |
 | `--opd-teacher-ckpt-step` | Optional checkpoint step for teacher model. |
 
 ## Mode Comparison
@@ -25,12 +26,14 @@ This example shows how to run **on-policy distillation (OPD)** using slime. A sm
 |------|------------------|-------------|
 | `sglang` | External SGLang server | Teacher has different architecture or larger than GPU memory |
 | `megatron` | Loaded into Megatron training | Teacher has same architecture as policy/ref model |
+| `self` | Custom rollout-provided logprobs | Current rollout model/router acts as teacher, often with privileged prompts |
 
 ## Components
 
 - `slime/rollout/on_policy_distillation.py` implements (for SGLang mode):
   - `reward_func` calls the teacher server (via `args.rm_url`) with every sample to obtain token-level logprobs.
   - `post_process_rewards` trims the teacher logprobs to the generated response span and writes the tensors back to each `Sample` to compute advantages.
+- `self` mode is intentionally a framework-level contract for custom rollout implementations: the rollout code must populate `Sample.teacher_log_probs`; slime then applies the same OPD advantage penalty.
 - `run-qwen3-8B-opd.sh` launches an SGLang teacher server, then submits a Ray job that runs `train.py`.
 - `run-qwen3-8B-opd-megatron.sh` uses Megatron-loaded teacher model (no external server needed).
 
@@ -101,9 +104,10 @@ Using Qwen3-8B-Base model sfted on part of the [OpenThoughts3-1.2M](https://hugg
 
 
 # FAQ
-1. **Why are there two OPD modes?**
+1. **Why are there multiple OPD modes?**
    - `sglang` mode: The teacher runs on an independent SGLang server. This is useful when the teacher has a different architecture or is too large to load together with the policy model.
    - `megatron` mode: The teacher is loaded into Megatron using the same parameter loading mechanism as the reference model. This requires the teacher to have the same architecture as the policy model.
+   - `self` mode: A custom rollout path provides teacher log-probs from the current rollout model/router, for example privileged-prompt self-distillation. No separate teacher checkpoint is loaded.
 
 2. **How do I use Megatron-based teacher instead of SGLang server?**
    Replace your OPD arguments:
@@ -118,7 +122,7 @@ Using Qwen3-8B-Base model sfted on part of the [OpenThoughts3-1.2M](https://hugg
    The system will raise clear errors:
    - `--use-opd` without `--opd-type`: Error asking you to specify type
    - `--opd-type megatron` without `--opd-teacher-load`: Error asking for teacher checkpoint
-   - `--opd-type sglang` with `--opd-teacher-load`: Error indicating conflict
+   - `--opd-type sglang` or `--opd-type self` with `--opd-teacher-load`: Error indicating conflict
 
 
 # References

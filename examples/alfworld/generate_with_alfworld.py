@@ -11,11 +11,14 @@ from __future__ import annotations
 
 import logging
 import os
+import uuid
 from argparse import Namespace
+from collections.abc import Iterable
 from collections import defaultdict
-from typing import Any, Iterable
+from typing import Any
 
 from alfworld_env import AlfWorldTextEpisode
+from opsd import annotate_opsd_teacher_log_probs, ensure_opsd_teacher_log_probs, opsd_enabled
 from prompts import ALFWORLD_SYSTEM_PROMPT, _task_description_from_reset, build_observation_prompt, parse_action
 
 from slime.rollout.filter_hub.base_types import DynamicFilterOutput
@@ -213,6 +216,8 @@ async def generate(
     tokenizer = state.tokenizer
     url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
     metadata = _get_metadata(sample)
+    if sample.session_id is None:
+        sample.session_id = str(uuid.uuid4())
 
     max_steps = _get_int_env("ALFWORLD_MAX_STEPS", DEFAULT_MAX_STEPS)
     history_length = _get_int_env("ALFWORLD_HISTORY_LENGTH", DEFAULT_HISTORY_LENGTH)
@@ -327,6 +332,7 @@ async def generate(
                 step_sample.response = response
                 step_sample.response_length = len(response_tokens)
                 step_sample.loss_mask = [1] * len(response_tokens)
+                step_sample.session_id = sample.session_id
                 step_sample.status = Sample.Status.TRUNCATED if finish_type == "length" else Sample.Status.COMPLETED
                 if response_log_probs is not None and len(response_log_probs) == len(response_tokens):
                     step_sample.rollout_log_probs = response_log_probs
@@ -337,6 +343,8 @@ async def generate(
                     "alfworld_step": step_record,
                 }
                 step_samples.append(step_sample)
+                if not evaluation and opsd_enabled(args):
+                    await annotate_opsd_teacher_log_probs(args, tokenizer, [step_sample])
 
             if done:
                 break
@@ -368,7 +376,9 @@ async def generate(
 
     if not step_samples:
         reason = "sglang_abort" if aborted else "empty_episode_response"
-        return [_make_placeholder_step_sample(sample, tokenizer, episode_metadata, reason)]
+        placeholder = _make_placeholder_step_sample(sample, tokenizer, episode_metadata, reason)
+        ensure_opsd_teacher_log_probs(args, [placeholder])
+        return [placeholder]
 
     # Keep the rollout-logprob field all-or-nothing.  The train-data converter
     # decides whether to include this column by checking the first sample, so a
@@ -385,6 +395,8 @@ async def generate(
             "turn_step": step_sample.metadata["turn_step"],
             "alfworld_step": step_sample.metadata["alfworld_step"],
         }
+
+    ensure_opsd_teacher_log_probs(args, step_samples)
 
     return step_samples
 
@@ -466,3 +478,15 @@ def grpo_normalize_alfworld_steps(args, samples: list[Sample]) -> tuple[list[flo
 
     processed = [normalized_by_traj[key] for key in sample_keys]
     return raw_rewards, processed
+
+
+def zero_alfworld_rewards_for_opsd(args, samples: list[Sample]) -> tuple[list[float], list[float]]:
+    """Return zero training rewards while preserving ALFWorld raw rewards.
+
+    This is the reward post-process hook for pure OPSD runs.  The environment
+    reward remains in ``raw_reward`` for logging/pass-rate metrics, but the
+    processed reward consumed by the advantage estimator is zero so the policy
+    gradient comes from slime's OPD advantage penalty.
+    """
+    raw_rewards = [sample.get_reward_value(args) for sample in samples]
+    return raw_rewards, [0.0] * len(samples)

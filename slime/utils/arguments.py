@@ -1049,12 +1049,14 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--opd-type",
                 type=str,
-                choices=["sglang", "megatron"],
+                choices=["sglang", "megatron", "self"],
                 default=None,
                 help=(
                     "Type of on-policy distillation. "
                     "'sglang': Teacher log-probs are obtained from external SGLang server during rollout. "
-                    "'megatron': Teacher model is loaded via --opd-teacher-load and forwarded during training."
+                    "'megatron': Teacher model is loaded via --opd-teacher-load and forwarded during training. "
+                    "'self': Teacher log-probs are supplied by a custom rollout path, usually by scoring "
+                    "the current rollout model/router under a privileged prompt."
                 ),
             )
             parser.add_argument(
@@ -1724,7 +1726,9 @@ def slime_validate_args(args):
     # Validate on-policy distillation (OPD) arguments
     if args.use_opd:
         if args.opd_type is None:
-            raise ValueError("--opd-type must be specified when --use-opd is enabled. Choose 'sglang' or 'megatron'.")
+            raise ValueError(
+                "--opd-type must be specified when --use-opd is enabled. Choose 'sglang', 'megatron', or 'self'."
+            )
 
         if args.opd_type == "megatron":
             if args.opd_teacher_load is None:
@@ -1742,11 +1746,11 @@ def slime_validate_args(args):
                     "please make sure it is a valid megatron checkpoint directory."
                 )
 
-        elif args.opd_type == "sglang":
+        elif args.opd_type in {"sglang", "self"}:
             if args.opd_teacher_load is not None:
                 raise ValueError(
-                    "--opd-teacher-load should not be set when --opd-type=sglang. "
-                    "In sglang mode, teacher log-probs are obtained from external server during rollout."
+                    f"--opd-teacher-load should not be set when --opd-type={args.opd_type}. "
+                    "Teacher log-probs are expected to be provided during rollout."
                 )
     else:
         # If OPD is not enabled, opd_teacher_load should not be set
