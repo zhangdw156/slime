@@ -81,16 +81,84 @@ class AlfWorldEpisodeWorker:
 
 
 class AlfWorldWorkerPool:
-    """Grow-only actor pool reused by the rollout manager process."""
+    """Bounded-lifetime actor pool for ALFWorld/TextWorld episodes.
+
+    TextWorld's PDDL backend loads Fast-Downward as a native shared library when
+    each ALFWorld environment is opened. Repeatedly opening new episodes inside
+    the same Ray worker process can accumulate native library mappings over long
+    runs, while explicitly dlclosing and reloading the library in-process is not
+    safe for Fast-Downward's global plugin registry. Keep the process lifetime
+    bounded instead: actors are retired after
+    ``ALFWORLD_ENV_WORKER_MAX_EPISODES`` episodes, defaulting to one episode for
+    the safest long-run behavior.
+    """
 
     def __init__(self) -> None:
-        self._workers: list[Any] = []
+        self._idle_workers: list[Any] = []
+        self._episode_counts: dict[int, int] = {}
+        self._created_count = 0
 
-    def ensure(self, size: int) -> list[Any]:
-        while len(self._workers) < size:
-            num_cpus = _get_float_env("ALFWORLD_ENV_WORKER_CPUS", 0.1)
-            self._workers.append(AlfWorldEpisodeWorker.options(num_cpus=num_cpus, num_gpus=0).remote())
-        return self._workers[:size]
+    @property
+    def created_count(self) -> int:
+        return self._created_count
+
+    @property
+    def idle_count(self) -> int:
+        return len(self._idle_workers)
+
+    @staticmethod
+    def max_episodes_per_worker() -> int:
+        return max(1, _get_int_env("ALFWORLD_ENV_WORKER_MAX_EPISODES", 1))
+
+    def _new_worker(self) -> Any:
+        num_cpus = _get_float_env("ALFWORLD_ENV_WORKER_CPUS", 0.1)
+        self._created_count += 1
+        return AlfWorldEpisodeWorker.options(num_cpus=num_cpus, num_gpus=0).remote()
+
+    def acquire(self, size: int) -> list[Any]:
+        workers: list[Any] = []
+        while len(workers) < size:
+            worker = self._idle_workers.pop() if self._idle_workers else self._new_worker()
+            self._episode_counts[id(worker)] = self._episode_counts.get(id(worker), 0) + 1
+            workers.append(worker)
+        return workers
+
+    def release(self, workers: list[Any]) -> None:
+        if not workers:
+            return
+
+        close_failed = False
+        close_refs = []
+        for worker in workers:
+            try:
+                close_refs.append(worker.close.remote())
+            except Exception:
+                close_failed = True
+                logger.warning("Failed to schedule ALFWorld worker close; retiring worker.", exc_info=True)
+
+        if close_refs:
+            try:
+                ray.get(close_refs)
+            except Exception:
+                close_failed = True
+                logger.warning(
+                    "Failed to close one or more ALFWorld workers; retiring this worker batch.",
+                    exc_info=True,
+                )
+
+        max_episodes = self.max_episodes_per_worker()
+        for worker in workers:
+            count_key = id(worker)
+            episode_count = self._episode_counts.get(count_key, 0)
+            should_retire = close_failed or episode_count >= max_episodes
+            if should_retire:
+                self._episode_counts.pop(count_key, None)
+                try:
+                    ray.kill(worker, no_restart=True)
+                except Exception:
+                    logger.debug("Failed to kill retired ALFWorld worker; it may already be dead.", exc_info=True)
+            else:
+                self._idle_workers.append(worker)
 
 
 _WORKER_POOL = AlfWorldWorkerPool()
@@ -383,95 +451,102 @@ async def _run_batched_episodes(
     invalid_action_penalty = _get_float_env("ALFWORLD_INVALID_ACTION_PENALTY", DEFAULT_INVALID_ACTION_PENALTY)
     config_path = _get_env_config_path()
 
-    workers = _WORKER_POOL.ensure(len(samples))
+    workers: list[Any] = []
     trajectories: list[TrajectoryState] = []
-    reset_refs = []
-    for worker, sample in zip(workers, samples, strict=True):
-        metadata = _get_metadata(sample)
-        if sample.session_id is None:
-            sample.session_id = str(uuid.uuid4())
-        trajectory_id = _trajectory_id(sample)
-        trajectories.append(
-            TrajectoryState(
-                sample=sample,
-                worker=worker,
-                metadata=metadata,
-                trajectory_id=trajectory_id,
-                evaluation=evaluation,
-            )
-        )
-        reset_refs.append(
-            worker.reset.remote(
-                config_path,
-                _env_split_from_metadata(metadata),
-                metadata.get("gamefile"),
-                int(getattr(args, "rollout_seed", 0)) + int(sample.index or 0),
-            )
-        )
-
-    reset_start = time.perf_counter()
-    reset_results = ray.get(reset_refs)
-    reset_time = time.perf_counter() - reset_start
-    for trajectory, reset_result in zip(trajectories, reset_results, strict=True):
-        trajectory.env_time += reset_time / max(1, len(trajectories))
-        trajectory.task_description = _task_description_from_reset(reset_result.observation)
-        trajectory.current_observation = reset_result.observation
-        trajectory.admissible_actions = reset_result.admissible_actions
-        trajectory.last_info = reset_result.info
-
-    for step_id in range(max_steps):
-        active = [trajectory for trajectory in trajectories if not trajectory.done and not trajectory.aborted]
-        if not active:
-            break
-
-        generation_results = await asyncio.gather(
-            *[
-                _generate_one_step(
-                    args=args,
-                    generate_state=generate_state,
-                    trajectory=trajectory,
-                    base_sampling_params=base_sampling_params,
-                    step_id=step_id,
-                    history_length=history_length,
-                    step_max_tokens=step_max_tokens,
+    try:
+        workers = _WORKER_POOL.acquire(len(samples))
+        reset_refs = []
+        for worker, sample in zip(workers, samples, strict=True):
+            metadata = _get_metadata(sample)
+            if sample.session_id is None:
+                sample.session_id = str(uuid.uuid4())
+            trajectory_id = _trajectory_id(sample)
+            trajectories.append(
+                TrajectoryState(
+                    sample=sample,
+                    worker=worker,
+                    metadata=metadata,
+                    trajectory_id=trajectory_id,
+                    evaluation=evaluation,
                 )
-                for trajectory in active
-            ]
-        )
-
-        step_items = []
-        step_refs = []
-        for result in generation_results:
-            trajectory = result["trajectory"]
-            env_action = _apply_generation_result(args, generate_state, result)
-            if env_action is None:
-                continue
-            step_items.append(result)
-            step_refs.append(trajectory.worker.step.remote(env_action))
-
-        if not step_refs:
-            continue
-
-        step_start = time.perf_counter()
-        step_results = ray.get(step_refs)
-        step_time = time.perf_counter() - step_start
-        per_trajectory_step_time = step_time / max(1, len(step_items))
-        step_samples: list[Sample] = []
-        for result, step_result in zip(step_items, step_results, strict=True):
-            trajectory = result["trajectory"]
-            previous_env_time = trajectory.env_time
-            trajectory.env_time += per_trajectory_step_time
-            result["non_generation_time"] = (
-                trajectory.env_time if result["step_id"] == 0 else trajectory.env_time - previous_env_time
             )
-            step_sample = _record_step_sample(args, trajectory, result, step_result, max_steps)
-            if step_sample is not None:
-                step_samples.append(step_sample)
+            reset_refs.append(
+                worker.reset.remote(
+                    config_path,
+                    _env_split_from_metadata(metadata),
+                    metadata.get("gamefile"),
+                    int(getattr(args, "rollout_seed", 0)) + int(sample.index or 0),
+                )
+            )
 
-        if not evaluation and step_samples and opsd_enabled(args):
-            await annotate_opsd_teacher_log_probs(args, generate_state.tokenizer, step_samples)
+        reset_start = time.perf_counter()
+        reset_results = ray.get(reset_refs)
+        reset_time = time.perf_counter() - reset_start
+        for trajectory, reset_result in zip(trajectories, reset_results, strict=True):
+            trajectory.env_time += reset_time / max(1, len(trajectories))
+            trajectory.task_description = _task_description_from_reset(reset_result.observation)
+            trajectory.current_observation = reset_result.observation
+            trajectory.admissible_actions = reset_result.admissible_actions
+            trajectory.last_info = reset_result.info
 
-    return [_finalize_trajectory(args, generate_state, trajectory, invalid_action_penalty) for trajectory in trajectories]
+        for step_id in range(max_steps):
+            active = [trajectory for trajectory in trajectories if not trajectory.done and not trajectory.aborted]
+            if not active:
+                break
+
+            generation_results = await asyncio.gather(
+                *[
+                    _generate_one_step(
+                        args=args,
+                        generate_state=generate_state,
+                        trajectory=trajectory,
+                        base_sampling_params=base_sampling_params,
+                        step_id=step_id,
+                        history_length=history_length,
+                        step_max_tokens=step_max_tokens,
+                    )
+                    for trajectory in active
+                ]
+            )
+
+            step_items = []
+            step_refs = []
+            for result in generation_results:
+                trajectory = result["trajectory"]
+                env_action = _apply_generation_result(args, generate_state, result)
+                if env_action is None:
+                    continue
+                step_items.append(result)
+                step_refs.append(trajectory.worker.step.remote(env_action))
+
+            if not step_refs:
+                continue
+
+            step_start = time.perf_counter()
+            step_results = ray.get(step_refs)
+            step_time = time.perf_counter() - step_start
+            per_trajectory_step_time = step_time / max(1, len(step_items))
+            step_samples: list[Sample] = []
+            for result, step_result in zip(step_items, step_results, strict=True):
+                trajectory = result["trajectory"]
+                previous_env_time = trajectory.env_time
+                trajectory.env_time += per_trajectory_step_time
+                result["non_generation_time"] = (
+                    trajectory.env_time if result["step_id"] == 0 else trajectory.env_time - previous_env_time
+                )
+                step_sample = _record_step_sample(args, trajectory, result, step_result, max_steps)
+                if step_sample is not None:
+                    step_samples.append(step_sample)
+
+            if not evaluation and step_samples and opsd_enabled(args):
+                await annotate_opsd_teacher_log_probs(args, generate_state.tokenizer, step_samples)
+
+        return [
+            _finalize_trajectory(args, generate_state, trajectory, invalid_action_penalty)
+            for trajectory in trajectories
+        ]
+    finally:
+        _WORKER_POOL.release(workers)
 
 
 def _first_sample(group: list[Sample | list[Sample]]) -> Sample:
@@ -632,7 +707,9 @@ async def _generate_train_rollout(args: Namespace, rollout_id: int, data_source:
 
     metrics = metric_gatherer.collect()
     metrics["rollout/alfworld_batched_episodes"] = sum(len(group) for group in data)
-    metrics["rollout/alfworld_worker_pool_size"] = len(_WORKER_POOL._workers)
+    metrics["rollout/alfworld_worker_pool_size"] = _WORKER_POOL.idle_count
+    metrics["rollout/alfworld_worker_processes_created"] = _WORKER_POOL.created_count
+    metrics["rollout/alfworld_worker_max_episodes"] = _WORKER_POOL.max_episodes_per_worker()
     metrics["rollout/alfworld_collect_time"] = time.perf_counter() - collect_start
     return RolloutFnTrainOutput(samples=data, metrics=metrics)
 

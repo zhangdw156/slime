@@ -68,9 +68,15 @@ ALFWORLD_TASK_DIR=/root/slime-alfworld \
 ALFWORLD_DATA=/root/.cache/alfworld \
 ALFWORLD_STEP_MAX_TOKENS=512 \
 ALFWORLD_ENV_WORKER_CPUS=0.1 \
+ALFWORLD_ENV_WORKER_MAX_EPISODES=1 \
 ALFWORLD_MAX_STEPS=50 \
 bash examples/alfworld/run_qwen2.5_3B_instruct_grpo.sh
 ```
+
+`ALFWORLD_ENV_WORKER_MAX_EPISODES` defaults to `1` so each Ray environment
+actor is retired after one ALFWorld episode. This avoids long-running
+TextWorld/Fast-Downward native-library accumulation without doing unsafe
+in-process `dlclose`/reload cycles.
 
 To run the GRPO+OPSD variant, use the `grpo_opsd` launcher instead:
 
@@ -91,7 +97,7 @@ Both OPSD launchers default to `OPSD_TYPE=self` and `ALFWORLD_OPSD_SKILLS_DIR=ex
 ## How the example works
 
 - `prepare_alfworld_data.py` scans `$ALFWORLD_DATA/json_2.1.1/{train,valid_seen,valid_unseen}` and keeps solvable `game.tw-pddl` tasks.
-- `batched_rollout.py` resets one `AlfredTWEnv` episode per trajectory in Ray actors, prompts the model with the current observation and admissible actions, parses `<think>...</think><action>...</action>`, steps all active environments in parallel, and returns step-level slime `Sample` objects.
+- `batched_rollout.py` resets one `AlfredTWEnv` episode per trajectory in Ray actors, prompts the model with the current observation and admissible actions, parses `<think>...</think><action>...</action>`, steps all active environments in parallel, retires environment actors after a bounded number of episodes, and returns step-level slime `Sample` objects.
 - `generate_with_alfworld.py` keeps the single-episode fallback implementation plus shared reward/filter/helper functions used by the batched rollout path.
 - `opsd.py` mirrors SDAR's ALFWorld privileged skill selection and scores fixed student responses to populate `Sample.teacher_log_probs` when slime OPD is enabled. The default `--opd-type self` path scores on the current rollout router; `OPSD_TYPE=sglang` can point to an external teacher through `ALFWORLD_OPSD_TEACHER_URL`.
 - The reward is `1 * won - ALFWORLD_INVALID_ACTION_PENALTY * invalid_action_count`; the default invalid-action penalty is `0.01`.
