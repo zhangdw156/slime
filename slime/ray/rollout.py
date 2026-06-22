@@ -3,7 +3,6 @@ import itertools
 import logging
 import multiprocessing
 import os
-import random
 import time
 from pathlib import Path
 from typing import Any
@@ -20,10 +19,11 @@ from slime.rollout.base_types import call_rollout_fn
 from slime.utils import logging_utils
 from slime.utils.dp_schedule import build_dp_schedule
 from slime.utils.health_monitor import RolloutHealthMonitor
-from slime.utils.http_utils import _wrap_ipv6, find_available_port, get_host_info, init_http_client
+from slime.utils.http_utils import _wrap_ipv6, close_http_client, get_host_info, init_http_client, terminate_process
 from slime.utils.logging_utils import configure_logger, init_tracking
 from slime.utils.metric_utils import compute_pass_rate, compute_rollout_step, compute_statistics, dict_add_prefix
 from slime.utils.misc import Box, group_by, load_function
+from slime.utils.port_allocator import reserve_ports
 from slime.utils.types import Sample
 
 from ..utils.metric_utils import has_repetition
@@ -34,6 +34,20 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
+
+
+@dataclasses.dataclass
+class RouterHandle:
+    ip: str
+    port: int
+    prometheus_port: int | None = None
+    process: multiprocessing.Process | None = None
+    owned: bool = True
+
+    def shutdown(self) -> None:
+        if self.owned and self.process is not None:
+            terminate_process(self.process)
+            self.process = None
 
 
 @dataclasses.dataclass
@@ -158,32 +172,47 @@ class ServerGroup:
         if self.num_new_engines == 0:
             return [], port_cursors
 
-        if self.args.rollout_external:
-            addr_and_ports = _allocate_rollout_engine_addr_and_ports_external(
-                args=self.args, rollout_engines=rollout_engines
-            )
-        else:
-            # Compute base_port from the maximum cursor across all nodes that
-            # this group's engines may land on (conservative: just use global max).
-            base_port = max(port_cursors.values()) if port_cursors else 15000
-            addr_and_ports, port_cursors = _allocate_rollout_engine_addr_and_ports_normal(
-                args=self.args,
-                rollout_engines=rollout_engines,
-                worker_type=self.worker_type,
-                num_gpus_per_engine=self.num_gpus_per_engine,
-                rank_offset=self.rank_offset,
-                base_port=base_port,
-            )
+        try:
+            if self.args.rollout_external:
+                addr_and_ports = _allocate_rollout_engine_addr_and_ports_external(
+                    args=self.args, rollout_engines=rollout_engines
+                )
+            else:
+                # base_port is ignored by the auto allocator, but keep the
+                # calculation for compatibility with older helper signatures.
+                base_port = max(port_cursors.values()) if port_cursors else 15000
+                addr_and_ports, port_cursors = _allocate_rollout_engine_addr_and_ports_normal(
+                    args=self.args,
+                    rollout_engines=rollout_engines,
+                    worker_type=self.worker_type,
+                    num_gpus_per_engine=self.num_gpus_per_engine,
+                    rank_offset=self.rank_offset,
+                    base_port=base_port,
+                )
 
-        init_handles = [
-            engine.init.remote(
-                **(addr_and_ports[rank]),
-                router_ip=self.router_ip,
-                router_port=self.router_port,
-            )
-            for rank, engine in rollout_engines
-        ]
-        return init_handles, port_cursors
+            init_handles = [
+                engine.init.remote(
+                    **(addr_and_ports[rank]),
+                    router_ip=self.router_ip,
+                    router_port=self.router_port,
+                )
+                for rank, engine in rollout_engines
+            ]
+            return init_handles, port_cursors
+        except Exception:
+            for rank, engine in rollout_engines:
+                try:
+                    ray.get(engine.shutdown.remote(), timeout=10)
+                except Exception:
+                    pass
+                try:
+                    ray.kill(engine, no_restart=True)
+                except Exception:
+                    pass
+                idx = rank - self.rank_offset
+                if 0 <= idx < len(self.all_engines):
+                    self.all_engines[idx] = None
+            raise
 
     def offload(self):
         """Fire release_memory_occupation on all engines (non-blocking).
@@ -230,6 +259,7 @@ class RolloutServer:
     server_groups: list[ServerGroup]
     router_ip: str | None = None
     router_port: int | None = None
+    router_handle: RouterHandle | None = None
     model_name: str = "default"
     update_weights: bool = True
 
@@ -356,6 +386,46 @@ class RolloutServer:
             handles.extend(g.onload(tags=[GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_CUDA_GRAPH]))
         return ray.get(handles) if handles else []
 
+    def shutdown(self, timeout: float = 60.0) -> None:
+        """Best-effort shutdown of SGLang engines, actors, and owned router."""
+
+        actors = [engine for engine in self.all_engines if engine is not None]
+        refs = []
+        for engine in actors:
+            try:
+                refs.append(engine.shutdown.remote())
+            except Exception as e:
+                logger.warning(f"Failed to request SGLang engine shutdown: {e}")
+
+        if refs:
+            ready, pending = ray.wait(refs, num_returns=len(refs), timeout=timeout)
+            for ref in ready:
+                try:
+                    ray.get(ref)
+                except Exception as e:
+                    logger.warning(f"SGLang engine shutdown raised: {e}")
+            for ref in pending:
+                try:
+                    ray.cancel(ref, force=True)
+                except Exception:
+                    pass
+                logger.warning("Timed out waiting for SGLang engine shutdown; killing actor.")
+
+        for engine in actors:
+            try:
+                ray.kill(engine, no_restart=True)
+            except Exception as e:
+                logger.warning(f"Failed to kill SGLang engine actor: {e}")
+
+        for group in self.server_groups:
+            group.all_engines = [None for _ in group.all_engines]
+
+        if self.router_handle is not None:
+            try:
+                self.router_handle.shutdown()
+            except Exception as e:
+                logger.warning(f"Failed to shutdown SGLang router {self.router_ip}:{self.router_port}: {e}")
+
 
 @ray.remote
 class RolloutManager:
@@ -366,41 +436,50 @@ class RolloutManager:
 
         self.pg = pg
         self.args = args
-
-        data_source_cls = load_function(self.args.data_source_path)
-        self.data_source = data_source_cls(args)
-
-        self.generate_rollout = load_function(self.args.rollout_function_path)
-        self.eval_generate_rollout = load_function(self.args.eval_function_path)
-        self.custom_reward_post_process_func = None
-        if self.args.custom_reward_post_process_path is not None:
-            self.custom_reward_post_process_func = load_function(self.args.custom_reward_post_process_path)
-        self.custom_convert_samples_to_train_data_func = None
-        if self.args.custom_convert_samples_to_train_data_path is not None:
-            self.custom_convert_samples_to_train_data_func = load_function(
-                self.args.custom_convert_samples_to_train_data_path
-            )
-        logger.info(f"import {self.args.rollout_function_path} as generate_rollout function.")
-        logger.info(f"import {self.args.eval_function_path} as eval_generate_rollout function.")
-
-        if self.args.debug_train_only:
-            self.servers: dict[str, RolloutServer] = {}
-        else:
-            init_http_client(args)
-            self.servers = start_rollout_servers(args, pg)
-
-        init_tracking(args, primary=False)
-        self.rollout_engine_lock = Lock.options(num_cpus=1, num_gpus=0).remote()
-        self.rollout_id = -1
-
+        self.servers: dict[str, RolloutServer] = {}
         self._health_monitors = []
-        if not self.args.debug_train_only and self.args.use_fault_tolerance:
-            for srv in self.servers.values():
-                for group in srv.server_groups:
-                    monitor = RolloutHealthMonitor(group, args)
-                    monitor.start()
-                    self._health_monitors.append(monitor)
-            self._ci_fault_injection_pending = self.args.ci_test  # Flag for CI fault injection
+        self._disposed = False
+
+        try:
+            data_source_cls = load_function(self.args.data_source_path)
+            self.data_source = data_source_cls(args)
+
+            self.generate_rollout = load_function(self.args.rollout_function_path)
+            self.eval_generate_rollout = load_function(self.args.eval_function_path)
+            self.custom_reward_post_process_func = None
+            if self.args.custom_reward_post_process_path is not None:
+                self.custom_reward_post_process_func = load_function(self.args.custom_reward_post_process_path)
+            self.custom_convert_samples_to_train_data_func = None
+            if self.args.custom_convert_samples_to_train_data_path is not None:
+                self.custom_convert_samples_to_train_data_func = load_function(
+                    self.args.custom_convert_samples_to_train_data_path
+                )
+            logger.info(f"import {self.args.rollout_function_path} as generate_rollout function.")
+            logger.info(f"import {self.args.eval_function_path} as eval_generate_rollout function.")
+
+            if self.args.debug_train_only:
+                self.servers = {}
+            else:
+                init_http_client(args)
+                self.servers = start_rollout_servers(args, pg)
+
+            init_tracking(args, primary=False)
+            self.rollout_engine_lock = Lock.options(num_cpus=1, num_gpus=0).remote()
+            self.rollout_id = -1
+
+            if not self.args.debug_train_only and self.args.use_fault_tolerance:
+                for srv in self.servers.values():
+                    for group in srv.server_groups:
+                        monitor = RolloutHealthMonitor(group, args)
+                        monitor.start()
+                        self._health_monitors.append(monitor)
+                self._ci_fault_injection_pending = self.args.ci_test  # Flag for CI fault injection
+        except Exception:
+            try:
+                self.dispose()
+            except Exception as cleanup_error:
+                logger.warning(f"Failed to cleanup RolloutManager after init error: {cleanup_error}")
+            raise
 
     def _get_metrics_router_addr(self) -> str | None:
         """Return the router address for scraping SGLang engine metrics.
@@ -441,8 +520,27 @@ class RolloutManager:
                 logger.warning(f"CI Fault Injection failed: {e}")
 
     def dispose(self):
-        for monitor in self._health_monitors:
-            monitor.stop()
+        if getattr(self, "_disposed", False):
+            return
+        self._disposed = True
+
+        for monitor in getattr(self, "_health_monitors", []):
+            try:
+                monitor.stop()
+            except Exception as e:
+                logger.warning(f"Failed to stop rollout health monitor: {e}")
+
+        for server in getattr(self, "servers", {}).values():
+            try:
+                server.shutdown()
+            except Exception as e:
+                logger.warning(f"Failed to shutdown rollout server {server.model_name}: {e}")
+
+        try:
+            close_http_client()
+        except Exception as e:
+            logger.warning(f"Failed to close rollout HTTP client: {e}")
+
         logging_utils.finish_tracking(self.args)
 
     @property
@@ -866,105 +964,87 @@ def _allocate_rollout_engine_addr_and_ports_normal(
     worker_type="regular",
     num_gpus_per_engine=None,
     rank_offset=0,
-    base_port=15000,
+    base_port=None,
 ):
-    # get ports
-    # there are 4 ports we need to allocate
-    # 1. server port
-    # 2. nccl port
-    # 3. dist_init_addr port
-    # 4. other ports for dp_attention, which is of size 4 + dp_size
+    """Reserve SGLang ports on the target Ray actor nodes.
+
+    Ports are leased by each ``SGLangEngine`` actor so the reservation happens
+    on the same node that will later bind the SGLang process.  The leases are
+    released inside ``SGLangEngine.init`` immediately before process launch.
+    """
+
+    _ = base_port  # Kept for API compatibility with older callers.
     _gpus_per_engine = num_gpus_per_engine or args.rollout_num_gpus_per_engine
-    num_engines_per_node = max(1, args.num_gpus_per_node // _gpus_per_engine)
+    nodes_per_engine = max(1, _gpus_per_engine // args.num_gpus_per_node)
+    dist_consecutive = 30 + args.sglang_dp_size
+
     addr_and_ports: dict[int, dict] = {}
+    engine_by_rank = {rank: engine for rank, engine in rollout_engines}
 
-    # Track per-node port cursors so that different server groups (called
-    # sequentially) never race for the same ports on a given node.
-    node_port_cursor: dict[int, int] = {}
+    def reserve(engine, role: str, consecutive: int = 1) -> dict:
+        return ray.get(engine.reserve_port.remote(role=role, consecutive=consecutive))
 
-    visited_nodes = set()
+    def add_lease(rank: int, lease: dict) -> None:
+        addr_and_ports.setdefault(rank, {}).setdefault("port_lease_tokens", []).append(lease["token"])
+
     for rank, engine in rollout_engines:
-        local_rank = rank - rank_offset
-        node_index = local_rank // num_engines_per_node
-        if node_index in visited_nodes:
-            continue
-        visited_nodes.add(node_index)
-        # TODO: currently when restarting engines, we will set port for all engines on this node starting with this rank.
-        # e.g. for 8 gpus, if we are restarting engine on gpu 3, we will set port for engine 3,4,5,6,7 on this node.
-        num_engines_on_this_node = num_engines_per_node - (local_rank % num_engines_per_node)
+        addr_and_ports.setdefault(rank, {})
 
-        def get_addr_and_ports(engine, node_idx):
-            # use small ports to prevent ephemeral port between 32768 and 65536.
-            # also, ray uses port 10002-19999, thus we avoid near-10002 to avoid racing condition
-            start_port = node_port_cursor.get(node_idx, base_port)
+        server_lease = reserve(engine, f"sglang:{worker_type}:server")
+        addr_and_ports[rank]["host"] = server_lease["host"]
+        addr_and_ports[rank]["port"] = server_lease["port"]
+        add_lease(rank, server_lease)
 
-            def port(consecutive=1):
-                nonlocal start_port
-                _, port = ray.get(
-                    engine._get_current_node_ip_and_free_port.remote(
-                        start_port=start_port,
-                        consecutive=consecutive,
-                    )
-                )
-                start_port = port + consecutive
-                node_port_cursor[node_idx] = start_port
-                return port
+        nccl_lease = reserve(engine, f"sglang:{worker_type}:nccl")
+        addr_and_ports[rank]["nccl_port"] = nccl_lease["port"]
+        add_lease(rank, nccl_lease)
 
-            def addr():
-                addr, _ = ray.get(engine._get_current_node_ip_and_free_port.remote())
-                return addr
+        if worker_type == "prefill":
+            bootstrap_lease = reserve(engine, f"sglang:{worker_type}:bootstrap")
+            addr_and_ports[rank]["disaggregation_bootstrap_port"] = bootstrap_lease["port"]
+            add_lease(rank, bootstrap_lease)
 
-            return addr, port
+    if nodes_per_engine > 1:
+        group_start_ranks = sorted({rank_offset + ((rank - rank_offset) // nodes_per_engine) * nodes_per_engine for rank, _ in rollout_engines})
+        for group_start in group_start_ranks:
+            owner = engine_by_rank.get(group_start)
+            assert owner is not None, f"First node rank {group_start} must be present for multi-node SGLang engine startup."
+            dist_lease = reserve(owner, f"sglang:{worker_type}:dist_init", consecutive=dist_consecutive)
+            dist_init_addr = f"{dist_lease['host']}:{dist_lease['port']}"
+            add_lease(group_start, dist_lease)
+            for i in range(nodes_per_engine):
+                rank = group_start + i
+                if rank in addr_and_ports:
+                    addr_and_ports[rank]["dist_init_addr"] = dist_init_addr
+    else:
+        for rank, engine in rollout_engines:
+            dist_lease = reserve(engine, f"sglang:{worker_type}:dist_init", consecutive=dist_consecutive)
+            addr_and_ports[rank]["dist_init_addr"] = f"{dist_lease['host']}:{dist_lease['port']}"
+            add_lease(rank, dist_lease)
 
-        get_addr, get_port = get_addr_and_ports(engine, node_index)
-
-        for i in range(num_engines_on_this_node):
-            current_rank = rank + i
-            addr_and_ports.setdefault(current_rank, {})
-            addr_and_ports[current_rank]["host"] = get_addr()
-            addr_and_ports[current_rank]["port"] = get_port()
-            addr_and_ports[current_rank]["nccl_port"] = get_port()
-
-            if worker_type == "prefill":
-                addr_and_ports[current_rank]["disaggregation_bootstrap_port"] = get_port()
-
-        if _gpus_per_engine > args.num_gpus_per_node:
-            num_node_per_engine = _gpus_per_engine // args.num_gpus_per_node
-            if local_rank % num_node_per_engine == 0:
-                # this is the first node in the engine, we need to allocate the dist_init_addr port
-                dist_init_addr = f"{get_addr()}:{get_port(30 + args.sglang_dp_size)}"
-                for i in range(num_node_per_engine):
-                    addr_and_ports.setdefault(rank + i, {})
-                    addr_and_ports[rank + i]["dist_init_addr"] = dist_init_addr
-        else:
-            for i in range(num_engines_on_this_node):
-                addr_and_ports[rank + i]["dist_init_addr"] = f"{get_addr()}:{get_port(30 + args.sglang_dp_size)}"
-
-    for i, _ in rollout_engines:
+    for i, _engine in rollout_engines:
         for key in ["port", "nccl_port", "dist_init_addr"]:
             assert key in addr_and_ports[i], f"Engine {i} {key} is not set."
         logger.info(f"Ports for engine {i}: {addr_and_ports[i]}")
 
-    return addr_and_ports, node_port_cursor
+    return addr_and_ports, {}
 
 
-def _start_router(args, *, has_pd_disaggregation: bool = False, force_new: bool = False) -> tuple[str, int]:
-    """Start sglang_router and return (router_ip, router_port).
+def _start_router(args, *, has_pd_disaggregation: bool = False, force_new: bool = False) -> RouterHandle:
+    """Start sglang_router and return its lifecycle handle."""
 
-    If ``args.sglang_router_ip`` is already set (e.g. by the user) and
-    ``force_new`` is False, skip launching and return the existing values.
-    When ``force_new`` is True (multi-model), always allocate a fresh port.
-    """
     if not force_new and args.sglang_router_ip is not None:
-        return args.sglang_router_ip, args.sglang_router_port
+        return RouterHandle(ip=args.sglang_router_ip, port=args.sglang_router_port, owned=False)
 
     router_ip = _wrap_ipv6(get_host_info()[1])
-    if force_new:
-        router_port = find_available_port(random.randint(3000, 4000))
+    router_port_lease = None
+    if force_new or args.sglang_router_port is None:
+        router_port_lease = reserve_ports(router_ip, role="sglang:router")
+        router_port = router_port_lease.port
     else:
         router_port = args.sglang_router_port
-        if router_port is None:
-            router_port = find_available_port(random.randint(3000, 4000))
+
+    prometheus_port_lease = reserve_ports(router_ip, role="sglang:router:prometheus")
 
     from sglang_router.launch_router import RouterArgs
 
@@ -973,7 +1053,7 @@ def _start_router(args, *, has_pd_disaggregation: bool = False, force_new: bool 
     router_args = RouterArgs.from_cli_args(args, use_router_prefix=True)
     router_args.host = router_ip
     router_args.port = router_port
-    router_args.prometheus_port = find_available_port(random.randint(4000, 5000))
+    router_args.prometheus_port = prometheus_port_lease.port
     router_args.log_level = "warn"
     router_args.request_timeout_secs = args.sglang_router_request_timeout_secs
 
@@ -994,12 +1074,26 @@ def _start_router(args, *, has_pd_disaggregation: bool = False, force_new: bool 
         args=(router_args,),
     )
     process.daemon = True  # Set the process as a daemon
+
+    # Release leased ports immediately before the router process binds them.
+    if router_port_lease is not None:
+        router_port_lease.release()
+    prometheus_port_lease.release()
+
     process.start()
     # Wait 3 seconds
     time.sleep(3)
-    assert process.is_alive()
+    if not process.is_alive():
+        terminate_process(process)
+        raise RuntimeError(f"SGLang router failed to start at {router_ip}:{router_port}")
     logger.info(f"Router launched at {router_ip}:{router_port}, Prometheus port: {router_args.prometheus_port}")
-    return router_ip, router_port
+    return RouterHandle(
+        ip=router_ip,
+        port=router_port,
+        prometheus_port=router_args.prometheus_port,
+        process=process,
+        owned=True,
+    )
 
 
 def _compute_rollout_offset(args) -> int:
@@ -1034,6 +1128,8 @@ def start_rollout_servers(args, pg) -> dict[str, RolloutServer]:
     config = _resolve_sglang_config(args)
 
     servers: dict[str, RolloutServer] = {}
+    started_groups: list[ServerGroup] = []
+    router_handles: list[RouterHandle] = []
     gpu_offset = 0
     engine_offset = 0
 
@@ -1041,118 +1137,144 @@ def start_rollout_servers(args, pg) -> dict[str, RolloutServer]:
     rollout_pg_offset = _compute_rollout_offset(args)
     megatron_num_gpus = _compute_megatron_num_gpus(args)
 
-    for model_idx, model_cfg in enumerate(config.models):
-        model_cfg.resolve(args)
+    try:
+        for model_idx, model_cfg in enumerate(config.models):
+            model_cfg.resolve(args)
 
-        has_pd = model_cfg.has_pd_disaggregation
-        router_ip, router_port = _start_router(args, has_pd_disaggregation=has_pd, force_new=(model_idx > 0))
+            has_pd = model_cfg.has_pd_disaggregation
+            router_handle = _start_router(args, has_pd_disaggregation=has_pd, force_new=(model_idx > 0))
+            router_handles.append(router_handle)
+            router_ip, router_port = router_handle.ip, router_handle.port
 
-        # Write back for backward compat (first model only).
-        if model_idx == 0:
-            args.sglang_router_ip = router_ip
-            args.sglang_router_port = router_port
+            # Write back for backward compat (first model only).
+            if model_idx == 0:
+                args.sglang_router_ip = router_ip
+                args.sglang_router_port = router_port
 
-        server_groups: list[ServerGroup] = []
-        port_cursors: dict[int, int] = {}
+            server_groups: list[ServerGroup] = []
+            port_cursors: dict[int, int] = {}
 
-        has_epd = model_cfg.has_encoder_disaggregation
+            has_epd = model_cfg.has_encoder_disaggregation
 
-        def _make_group(group_cfg, router_ip, router_port, overrides_extra=None):
-            nonlocal engine_offset, gpu_offset
-            gpus_per_engine = group_cfg.num_gpus_per_engine
-            num_gpu_per_engine_local = min(gpus_per_engine, args.num_gpus_per_node)
-            num_engines = group_cfg.num_gpus // num_gpu_per_engine_local
+            def _make_group(group_cfg, router_ip, router_port, overrides_extra=None):
+                nonlocal engine_offset, gpu_offset
+                gpus_per_engine = group_cfg.num_gpus_per_engine
+                num_gpu_per_engine_local = min(gpus_per_engine, args.num_gpus_per_node)
+                num_engines = group_cfg.num_gpus // num_gpu_per_engine_local
 
-            group_abs_start = rollout_pg_offset + gpu_offset
-            needs_offload = args.offload_rollout and group_abs_start < megatron_num_gpus
-            overrides = dict(group_cfg.overrides)
-            if overrides_extra:
-                for k, v in overrides_extra.items():
-                    overrides.setdefault(k, v)
-            if args.offload_rollout and not needs_offload:
-                overrides.setdefault("enable_memory_saver", False)
-            logger.info(
-                f"Engine group '{group_cfg.worker_type}' gpu_offset={gpu_offset} "
-                f"(abs={group_abs_start}): needs_offload={needs_offload}"
-            )
+                group_abs_start = rollout_pg_offset + gpu_offset
+                needs_offload = args.offload_rollout and group_abs_start < megatron_num_gpus
+                overrides = dict(group_cfg.overrides)
+                if overrides_extra:
+                    for k, v in overrides_extra.items():
+                        overrides.setdefault(k, v)
+                if args.offload_rollout and not needs_offload:
+                    overrides.setdefault("enable_memory_saver", False)
+                logger.info(
+                    f"Engine group '{group_cfg.worker_type}' gpu_offset={gpu_offset} "
+                    f"(abs={group_abs_start}): needs_offload={needs_offload}"
+                )
 
-            group = ServerGroup(
-                args=args,
-                pg=pg,
-                all_engines=[None] * num_engines if group_cfg.worker_type != "placeholder" else [],
-                num_gpus_per_engine=gpus_per_engine,
-                num_new_engines=0,
-                worker_type=group_cfg.worker_type,
-                rank_offset=engine_offset,
-                gpu_offset=gpu_offset,
-                sglang_overrides=overrides,
-                needs_offload=needs_offload,
-                model_path=overrides.get("model_path", args.hf_checkpoint),
+                group = ServerGroup(
+                    args=args,
+                    pg=pg,
+                    all_engines=[None] * num_engines if group_cfg.worker_type != "placeholder" else [],
+                    num_gpus_per_engine=gpus_per_engine,
+                    num_new_engines=0,
+                    worker_type=group_cfg.worker_type,
+                    rank_offset=engine_offset,
+                    gpu_offset=gpu_offset,
+                    sglang_overrides=overrides,
+                    needs_offload=needs_offload,
+                    model_path=overrides.get("model_path", args.hf_checkpoint),
+                    router_ip=router_ip,
+                    router_port=router_port,
+                )
+                engine_offset += num_engines
+                gpu_offset += group_cfg.num_gpus
+                return group
+
+            if has_epd:
+                # --- Phase 1: start encoder groups, wait, collect URLs ---
+                encoder_urls: list[str] = []
+                for group_cfg in model_cfg.server_groups:
+                    if group_cfg.worker_type != "encoder":
+                        continue
+                    group = _make_group(group_cfg, router_ip, router_port)
+                    handles, port_cursors = group.start_engines(port_cursors)
+                    if handles:
+                        ray.get(handles)
+                    urls = ray.get([e.get_url.remote() for e in group.engines])
+                    encoder_urls.extend(u for u in urls if u is not None)
+                    server_groups.append(group)
+                    started_groups.append(group)
+
+                logger.info(f"EPD phase 1 done: collected {len(encoder_urls)} encoder URLs: {encoder_urls}")
+
+                # --- Phase 2: start non-encoder groups, injecting encoder URLs into
+                # language-only LLM workers. Prefill groups use this for full EPD,
+                # while regular groups allow encoder/LLM split without PD.
+                non_encoder_handles: list = []
+                for group_cfg in model_cfg.server_groups:
+                    if group_cfg.worker_type == "encoder":
+                        continue
+                    overrides_extra = {}
+                    if encoder_urls and group_cfg.worker_type in ("prefill", "regular"):
+                        overrides_extra["language_only"] = True
+                        overrides_extra["encoder_urls"] = encoder_urls
+                    group = _make_group(group_cfg, router_ip, router_port, overrides_extra=overrides_extra)
+                    handles, port_cursors = group.start_engines(port_cursors)
+                    non_encoder_handles.extend(handles)
+                    server_groups.append(group)
+                    started_groups.append(group)
+
+                if non_encoder_handles:
+                    ray.get(non_encoder_handles)
+            else:
+                # No EPD — start all groups in one pass (original path).
+                all_init_handles: list = []
+                for group_cfg in model_cfg.server_groups:
+                    group = _make_group(group_cfg, router_ip, router_port)
+                    handles, port_cursors = group.start_engines(port_cursors)
+                    all_init_handles.extend(handles)
+                    server_groups.append(group)
+                    started_groups.append(group)
+
+                if all_init_handles:
+                    ray.get(all_init_handles)
+
+            servers[model_cfg.name] = RolloutServer(
+                server_groups=server_groups,
                 router_ip=router_ip,
                 router_port=router_port,
+                router_handle=router_handle,
+                model_name=model_cfg.name,
+                update_weights=model_cfg.update_weights,
             )
-            engine_offset += num_engines
-            gpu_offset += group_cfg.num_gpus
-            return group
 
-        if has_epd:
-            # --- Phase 1: start encoder groups, wait, collect URLs ---
-            encoder_urls: list[str] = []
-            for group_cfg in model_cfg.server_groups:
-                if group_cfg.worker_type != "encoder":
-                    continue
-                group = _make_group(group_cfg, router_ip, router_port)
-                handles, port_cursors = group.start_engines(port_cursors)
-                if handles:
-                    ray.get(handles)
-                urls = ray.get([e.get_url.remote() for e in group.engines])
-                encoder_urls.extend(u for u in urls if u is not None)
-                server_groups.append(group)
+        # Expose per-model router info for custom rollout functions.
+        args.sglang_model_routers = {name: (srv.router_ip, srv.router_port) for name, srv in servers.items()}
 
-            logger.info(f"EPD phase 1 done: collected {len(encoder_urls)} encoder URLs: {encoder_urls}")
+        return servers
+    except Exception:
+        for server in servers.values():
+            try:
+                server.shutdown()
+            except Exception as e:
+                logger.warning(f"Failed to cleanup started rollout server after startup error: {e}")
 
-            # --- Phase 2: start non-encoder groups, injecting encoder URLs into
-            # language-only LLM workers. Prefill groups use this for full EPD,
-            # while regular groups allow encoder/LLM split without PD.
-            non_encoder_handles: list = []
-            for group_cfg in model_cfg.server_groups:
-                if group_cfg.worker_type == "encoder":
-                    continue
-                overrides_extra = {}
-                if encoder_urls and group_cfg.worker_type in ("prefill", "regular"):
-                    overrides_extra["language_only"] = True
-                    overrides_extra["encoder_urls"] = encoder_urls
-                group = _make_group(group_cfg, router_ip, router_port, overrides_extra=overrides_extra)
-                handles, port_cursors = group.start_engines(port_cursors)
-                non_encoder_handles.extend(handles)
-                server_groups.append(group)
+        if started_groups:
+            try:
+                RolloutServer(server_groups=started_groups).shutdown()
+            except Exception as e:
+                logger.warning(f"Failed to cleanup partially started SGLang groups after startup error: {e}")
 
-            if non_encoder_handles:
-                ray.get(non_encoder_handles)
-        else:
-            # No EPD — start all groups in one pass (original path).
-            all_init_handles: list = []
-            for group_cfg in model_cfg.server_groups:
-                group = _make_group(group_cfg, router_ip, router_port)
-                handles, port_cursors = group.start_engines(port_cursors)
-                all_init_handles.extend(handles)
-                server_groups.append(group)
-
-            if all_init_handles:
-                ray.get(all_init_handles)
-
-        servers[model_cfg.name] = RolloutServer(
-            server_groups=server_groups,
-            router_ip=router_ip,
-            router_port=router_port,
-            model_name=model_cfg.name,
-            update_weights=model_cfg.update_weights,
-        )
-
-    # Expose per-model router info for custom rollout functions.
-    args.sglang_model_routers = {name: (srv.router_ip, srv.router_port) for name, srv in servers.items()}
-
-    return servers
+        for router_handle in router_handles:
+            try:
+                router_handle.shutdown()
+            except Exception as e:
+                logger.warning(f"Failed to cleanup started router after startup error: {e}")
+        raise
 
 
 def _resolve_sglang_config(args) -> SglangConfig:

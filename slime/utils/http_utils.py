@@ -198,6 +198,43 @@ async def _post(client, url, payload, max_retries=60, headers=None):
     return output
 
 
+def close_http_client() -> None:
+    """Close rollout HTTP clients and kill distributed poster actors."""
+
+    global _http_client, _client_concurrency, _distributed_post_enabled, _post_actors, _post_actor_idx
+
+    if _http_client is not None:
+        client = _http_client
+        _http_client = None
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            asyncio.run(client.aclose())
+        else:
+            if running_loop.is_running():
+                running_loop.create_task(client.aclose())
+            else:
+                running_loop.run_until_complete(client.aclose())
+
+    _client_concurrency = 0
+    _distributed_post_enabled = False
+
+    if _post_actors:
+        try:
+            import ray
+
+            for actor in _post_actors:
+                try:
+                    ray.kill(actor, no_restart=True)
+                except Exception as e:
+                    logger.info(f"Failed to kill distributed HTTP poster actor: {e}")
+        except Exception as e:
+            logger.info(f"Failed to cleanup distributed HTTP poster actors: {e}")
+        finally:
+            _post_actors = []
+            _post_actor_idx = 0
+
+
 def init_http_client(args):
     """Initialize HTTP client and optionally enable distributed POST via Ray."""
     global _http_client, _client_concurrency, _distributed_post_enabled

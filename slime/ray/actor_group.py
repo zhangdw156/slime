@@ -156,3 +156,11 @@ class RayTrainGroup:
 
     def set_rollout_manager(self, rollout_manager):
         return ray.get([actor.set_rollout_manager.remote(rollout_manager) for actor in self._actor_handlers])
+
+    def dispose(self):
+        for actor in self._actor_handlers:
+            try:
+                ray.kill(actor, no_restart=True)
+            except Exception:
+                pass
+        self._actor_handlers = []

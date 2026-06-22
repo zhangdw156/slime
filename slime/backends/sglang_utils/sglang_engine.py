@@ -4,6 +4,7 @@ import logging
 import multiprocessing
 import os
 import time
+import uuid
 from urllib.parse import quote
 
 import requests
@@ -15,6 +16,8 @@ from urllib3.exceptions import NewConnectionError
 
 from slime.ray.ray_actor import RayActor
 from slime.utils.http_utils import get_host_info
+from slime.utils.misc import get_current_node_ip
+from slime.utils.port_allocator import PortLease, reserve_ports
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +116,39 @@ class SGLangEngine(RayActor):
         self.base_gpu_id = base_gpu_id
         self.sglang_overrides = sglang_overrides or {}
         self.num_gpus_per_engine = num_gpus_per_engine
+        self.process: multiprocessing.Process | None = None
+        self.node_rank: int | None = None
+        self.server_host: str | None = None
+        self.server_port: int | None = None
+        self.router_ip: str | None = None
+        self.router_port: int | None = None
+        self._port_leases: dict[str, PortLease] = {}
+
+    def reserve_port(self, role: str, consecutive: int = 1) -> dict:
+        """Reserve port(s) on the Ray node where this SGLang actor runs."""
+
+        host = get_current_node_ip()
+        lease = reserve_ports(host, count=consecutive, role=role)
+        token = uuid.uuid4().hex
+        self._port_leases[token] = lease
+        return {
+            "token": token,
+            "host": lease.host,
+            "port": lease.port,
+            "ports": list(lease.ports),
+            "role": role,
+        }
+
+    def release_port_leases(self, tokens: list[str] | None = None) -> None:
+        """Release reserved ports. Idempotent and safe during cleanup."""
+
+        if tokens is None:
+            tokens = list(self._port_leases.keys())
+
+        for token in tokens:
+            lease = self._port_leases.pop(token, None)
+            if lease is not None:
+                lease.release()
 
     def init(
         self,
@@ -123,6 +159,7 @@ class SGLangEngine(RayActor):
         disaggregation_bootstrap_port=None,
         router_ip=None,
         router_port=None,
+        port_lease_tokens=None,
     ):
         self.router_ip = router_ip if router_ip is not None else self.args.sglang_router_ip
         self.router_port = router_port if router_port is not None else self.args.sglang_router_port
@@ -164,7 +201,7 @@ class SGLangEngine(RayActor):
         if self.args.rollout_external:
             self._init_external(server_args_dict, external_engine_need_check_fields=external_engine_need_check_fields)
         else:
-            self._init_normal(server_args_dict)
+            self._init_normal(server_args_dict, port_lease_tokens=port_lease_tokens or [])
 
     def _init_external(self, expect_server_args, external_engine_need_check_fields):
         logger.info(f"Use external SGLang engine (rank={self.rank}, expect_server_args={expect_server_args})")
@@ -190,8 +227,10 @@ class SGLangEngine(RayActor):
         actual_server_args = _get_actual_server_args()
         _sanity_check_server_args(actual_server_args, expect_server_args)
 
-    def _init_normal(self, server_args_dict):
+    def _init_normal(self, server_args_dict, port_lease_tokens: list[str]):
         logger.info(f"Launch HttpServerEngineAdapter at: {self.server_host}:{self.server_port}")
+        # Keep the reservation until the last moment before SGLang binds.
+        self.release_port_leases(port_lease_tokens)
         self.process = launch_server_process(ServerArgs(**server_args_dict))
 
         if self.worker_type == "encoder":
@@ -312,22 +351,23 @@ class SGLangEngine(RayActor):
         return f"http://{self.server_host}:{self.server_port}"
 
     def shutdown(self):
+        self.release_port_leases()
         if self.args.rollout_external:
             return
 
         logger.info(f"Shutdown engine {self.server_host}:{self.server_port}...")
-        if self.worker_type != "encoder" and self.node_rank == 0:
+        if self.worker_type != "encoder" and self.node_rank == 0 and self.router_ip and self.router_port:
             worker_url = f"http://{self.server_host}:{self.server_port}"
             response = None
-            if parse(sglang_router.__version__) <= parse("0.2.1"):
-                response = requests.post(
-                    f"http://{self.router_ip}:{self.router_port}/remove_worker?url=http://{self.server_host}:{self.server_port}"
-                )
-            elif parse(sglang_router.__version__) < parse("0.3.0"):
-                worker_url = quote(worker_url, safe="")
-                response = requests.delete(f"http://{self.router_ip}:{self.router_port}/workers/{worker_url}")
-            else:
-                try:
+            try:
+                if parse(sglang_router.__version__) <= parse("0.2.1"):
+                    response = requests.post(
+                        f"http://{self.router_ip}:{self.router_port}/remove_worker?url=http://{self.server_host}:{self.server_port}"
+                    )
+                elif parse(sglang_router.__version__) < parse("0.3.0"):
+                    worker_url = quote(worker_url, safe="")
+                    response = requests.delete(f"http://{self.router_ip}:{self.router_port}/workers/{worker_url}")
+                else:
                     all_workers = requests.get(f"http://{self.router_ip}:{self.router_port}/workers").json()["workers"]
                     for worker in all_workers:
                         if worker["url"] == worker_url:
@@ -338,12 +378,19 @@ class SGLangEngine(RayActor):
                             break
                     else:
                         logger.warning(f"Worker {worker_url} not found in router during shutdown.")
-                except Exception as e:
-                    logger.warning(f"Failed to fetch workers list or remove worker: {e}")
 
-            if response is not None:
-                response.raise_for_status()
-        kill_process_tree(self.process.pid)
+                if response is not None:
+                    response.raise_for_status()
+            except Exception as e:
+                logger.warning(f"Failed to remove worker {worker_url} from router during shutdown: {e}")
+
+        process = self.process
+        self.process = None
+        if process is not None and process.pid is not None:
+            try:
+                kill_process_tree(process.pid)
+            except Exception as e:
+                logger.warning(f"Failed to kill SGLang process tree pid={process.pid}: {e}")
 
     def get_weight_version(self):
         if self.node_rank != 0:
