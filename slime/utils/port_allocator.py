@@ -80,17 +80,31 @@ class PortLease:
         self.release()
 
 
-def reserve_ports(host: str | None, *, count: int = 1, role: str = "", max_attempts: int = 256) -> PortLease:
+def reserve_ports(
+    host: str | None,
+    *,
+    count: int = 1,
+    role: str = "",
+    max_attempts: int = 256,
+    max_port: int = 65535,
+) -> PortLease:
     """Reserve one TCP port or a consecutive TCP port range on *host*.
 
     ``count=1`` binds to port 0 and lets the OS choose an available port.
     ``count>1`` first asks the OS for a start port, then tries to reserve the
     following ports consecutively.  This keeps the caller off fixed ranges while
     still supporting components that need adjacent helper ports.
+
+    ``max_port`` caps the highest reserved port.  This is useful for services
+    whose own helpers derive additional ports from the public port.
     """
 
     if count < 1:
         raise ValueError(f"count must be >= 1, got {count}")
+    if not (1 <= max_port <= 65535):
+        raise ValueError(f"max_port must be between 1 and 65535, got {max_port}")
+    if count > max_port:
+        raise ValueError(f"count={count} cannot fit below max_port={max_port}")
 
     bind_host = _normalize_host(host)
     for _ in range(max_attempts):
@@ -99,23 +113,35 @@ def reserve_ports(host: str | None, *, count: int = 1, role: str = "", max_attem
             first = _bind_socket(bind_host, 0)
             sockets.append(first)
             start_port = first.getsockname()[1]
+            end_port = start_port + count - 1
+            if end_port > max_port:
+                raise OSError(
+                    f"consecutive port range exceeds max_port={max_port}: "
+                    f"start={start_port}, count={count}"
+                )
             ports = [start_port]
 
             for offset in range(1, count):
                 port = start_port + offset
-                if port > 65535:
-                    raise OSError(f"consecutive port range exceeds 65535: start={start_port}, count={count}")
                 sockets.append(_bind_socket(bind_host, port))
                 ports.append(port)
 
-            return PortLease(host=bind_host, ports=tuple(ports), role=role, sockets=sockets)
+            return PortLease(
+                host=bind_host,
+                ports=tuple(ports),
+                role=role,
+                sockets=sockets,
+            )
         except OSError:
             for sock in sockets:
                 with contextlib.suppress(Exception):
                     sock.close()
             continue
 
-    raise RuntimeError(f"Could not reserve {count} consecutive port(s) on {bind_host!r} for role={role!r}")
+    raise RuntimeError(
+        f"Could not reserve {count} consecutive port(s) on {bind_host!r} "
+        f"for role={role!r} below max_port={max_port}"
+    )
 
 
 def release_port_leases(leases: Iterable[PortLease]) -> None:

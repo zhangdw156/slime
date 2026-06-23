@@ -124,11 +124,21 @@ class SGLangEngine(RayActor):
         self.router_port: int | None = None
         self._port_leases: dict[str, PortLease] = {}
 
-    def reserve_port(self, role: str, consecutive: int = 1) -> dict:
+    def reserve_port(
+        self,
+        role: str,
+        consecutive: int = 1,
+        max_port: int = 65535,
+    ) -> dict:
         """Reserve port(s) on the Ray node where this SGLang actor runs."""
 
         host = get_current_node_ip()
-        lease = reserve_ports(host, count=consecutive, role=role)
+        lease = reserve_ports(
+            host,
+            count=consecutive,
+            role=role,
+            max_port=max_port,
+        )
         token = uuid.uuid4().hex
         self._port_leases[token] = lease
         return {

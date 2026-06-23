@@ -35,6 +35,12 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
 
+# SGLang derives its internal gRPC port as ``ServerArgs.port + 10000``
+# when SGLANG_GRPC_PORT is not set.  Keep automatically allocated public
+# server ports below this ceiling so the derived gRPC port stays valid.
+SGLANG_GRPC_PORT_OFFSET = 10000
+SGLANG_MAX_SERVER_PORT = 65535 - SGLANG_GRPC_PORT_OFFSET
+
 
 @dataclasses.dataclass
 class RouterHandle:
@@ -981,8 +987,19 @@ def _allocate_rollout_engine_addr_and_ports_normal(
     addr_and_ports: dict[int, dict] = {}
     engine_by_rank = {rank: engine for rank, engine in rollout_engines}
 
-    def reserve(engine, role: str, consecutive: int = 1) -> dict:
-        return ray.get(engine.reserve_port.remote(role=role, consecutive=consecutive))
+    def reserve(
+        engine,
+        role: str,
+        consecutive: int = 1,
+        max_port: int = 65535,
+    ) -> dict:
+        return ray.get(
+            engine.reserve_port.remote(
+                role=role,
+                consecutive=consecutive,
+                max_port=max_port,
+            )
+        )
 
     def add_lease(rank: int, lease: dict) -> None:
         addr_and_ports.setdefault(rank, {}).setdefault("port_lease_tokens", []).append(lease["token"])
@@ -990,7 +1007,11 @@ def _allocate_rollout_engine_addr_and_ports_normal(
     for rank, engine in rollout_engines:
         addr_and_ports.setdefault(rank, {})
 
-        server_lease = reserve(engine, f"sglang:{worker_type}:server")
+        server_lease = reserve(
+            engine,
+            f"sglang:{worker_type}:server",
+            max_port=SGLANG_MAX_SERVER_PORT,
+        )
         addr_and_ports[rank]["host"] = server_lease["host"]
         addr_and_ports[rank]["port"] = server_lease["port"]
         add_lease(rank, server_lease)
