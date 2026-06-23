@@ -54,7 +54,7 @@ NUM_GPUS=${NUM_GPUS:-4}
 TP_SIZE=${TP_SIZE:-1}
 MAX_TOKENS_PER_GPU=${MAX_TOKENS_PER_GPU:-16384}
 export SCIENCEWORLD_EVAL_BATCH_SIZE=${SCIENCEWORLD_EVAL_BATCH_SIZE:-$((ROLLOUT_BATCH_SIZE * N_SAMPLES_PER_PROMPT))}
-RAY_TEMP_DIR=${RAY_TEMP_DIR:-/root/shared/ray_temp}
+RAY_TEMP_ROOT=${RAY_TEMP_ROOT:-/root/shared/ray_temp}
 
 CKPT_ARGS=(
    --hf-checkpoint "${MODEL_ROOT}/"
@@ -174,9 +174,126 @@ CUSTOM_ARGS=(
    --rollout-function-path batched_rollout.generate_rollout
 )
 
+find_free_ports() {
+   local count="$1"
+   python3 - "${count}" <<'PY'
+import socket
+import sys
+
+count = int(sys.argv[1])
+sockets = []
+try:
+    for _ in range(count):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.bind(("", 0))
+        sockets.append(sock)
+    for sock in sockets:
+        print(sock.getsockname()[1])
+finally:
+    for sock in sockets:
+        sock.close()
+PY
+}
+
+find_free_port_range() {
+   local count="$1"
+   local start_min="${RAY_WORKER_PORT_RANGE_START:-23000}"
+   local start_max="${RAY_WORKER_PORT_RANGE_END:-29999}"
+   python3 - "${count}" "${start_min}" "${start_max}" <<'PY'
+import socket
+import sys
+
+count = int(sys.argv[1])
+start_min = int(sys.argv[2])
+start_max = int(sys.argv[3])
+
+for start in range(start_min, start_max - count + 2):
+    sockets = []
+    try:
+        for port in range(start, start + count):
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.bind(("", port))
+            sockets.append(sock)
+        print(start)
+        break
+    except OSError:
+        continue
+    finally:
+        for sock in sockets:
+            sock.close()
+else:
+    raise SystemExit(f"No free consecutive port range of size {count} in [{start_min}, {start_max}]")
+PY
+}
+
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
-mkdir -p "${RAY_TEMP_DIR}"
-ray start --head --node-ip-address "${MASTER_ADDR}" --num-gpus "${NUM_GPUS}" --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265 --temp-dir "${RAY_TEMP_DIR}"
+RAY_OWNED_CLUSTER=0
+RAY_JOB_ACTIVE=0
+RAY_JOB_SUBMISSION_ID=${RAY_JOB_SUBMISSION_ID:-"scienceworld-${USER:-user}-$(date +%Y%m%d%H%M%S)-$$"}
+RAY_WORKER_PORT_RANGE_SIZE=${RAY_WORKER_PORT_RANGE_SIZE:-200}
+SCIENCEWORLD_RAY_STOP_ON_EXIT=${SCIENCEWORLD_RAY_STOP_ON_EXIT:-1}
+
+cleanup() {
+   local exit_code="${1:-$?}"
+   trap - EXIT INT TERM
+   set +e
+
+   if [[ "${RAY_JOB_ACTIVE:-0}" == "1" && -n "${RAY_JOB_ADDRESS:-}" && -n "${RAY_JOB_SUBMISSION_ID:-}" ]]; then
+      echo "Stopping Ray job ${RAY_JOB_SUBMISSION_ID} at ${RAY_JOB_ADDRESS}."
+      ray job stop --address="${RAY_JOB_ADDRESS}" "${RAY_JOB_SUBMISSION_ID}" || true
+   fi
+
+   if [[ "${RAY_OWNED_CLUSTER:-0}" == "1" && "${SCIENCEWORLD_RAY_STOP_ON_EXIT:-1}" == "1" ]]; then
+      echo "Stopping Ray cluster started by this script."
+      ray stop --force || true
+   fi
+
+   if [[ "${RAY_TEMP_DIR_OWNED:-0}" == "1" && -n "${RAY_TEMP_DIR:-}" ]]; then
+      rm -rf "${RAY_TEMP_DIR}" || true
+   fi
+
+   exit "${exit_code}"
+}
+trap 'cleanup $?' EXIT
+trap 'cleanup 130' INT
+trap 'cleanup 143' TERM
+
+if [[ -z "${RAY_JOB_ADDRESS:-}" ]]; then
+   if [[ -z "${RAY_TEMP_DIR:-}" ]]; then
+      RAY_TEMP_DIR="${RAY_TEMP_ROOT%/}/scienceworld-$(date +%Y%m%d%H%M%S)-$$"
+      RAY_TEMP_DIR_OWNED=1
+   else
+      RAY_TEMP_DIR_OWNED=${SCIENCEWORLD_CLEAN_RAY_TEMP:-0}
+   fi
+   mkdir -p "${RAY_TEMP_DIR}"
+
+   RAY_AUTO_PORTS=($(find_free_ports 4))
+   RAY_HEAD_PORT=${RAY_HEAD_PORT:-${RAY_AUTO_PORTS[0]}}
+   RAY_DASHBOARD_PORT=${RAY_DASHBOARD_PORT:-${RAY_AUTO_PORTS[1]}}
+   RAY_OBJECT_MANAGER_PORT=${RAY_OBJECT_MANAGER_PORT:-${RAY_AUTO_PORTS[2]}}
+   RAY_NODE_MANAGER_PORT=${RAY_NODE_MANAGER_PORT:-${RAY_AUTO_PORTS[3]}}
+   RAY_MIN_WORKER_PORT=${RAY_MIN_WORKER_PORT:-$(find_free_port_range "${RAY_WORKER_PORT_RANGE_SIZE}")}
+   RAY_MAX_WORKER_PORT=${RAY_MAX_WORKER_PORT:-$((RAY_MIN_WORKER_PORT + RAY_WORKER_PORT_RANGE_SIZE - 1))}
+   export RAY_JOB_ADDRESS="http://127.0.0.1:${RAY_DASHBOARD_PORT}"
+
+   echo "Starting Ray with auto ports: head=${RAY_HEAD_PORT}, dashboard=${RAY_DASHBOARD_PORT}, object=${RAY_OBJECT_MANAGER_PORT}, node=${RAY_NODE_MANAGER_PORT}, workers=${RAY_MIN_WORKER_PORT}-${RAY_MAX_WORKER_PORT}, temp=${RAY_TEMP_DIR}"
+   RAY_OWNED_CLUSTER=1
+   ray start --head \
+      --node-ip-address "${MASTER_ADDR}" \
+      --port "${RAY_HEAD_PORT}" \
+      --object-manager-port "${RAY_OBJECT_MANAGER_PORT}" \
+      --node-manager-port "${RAY_NODE_MANAGER_PORT}" \
+      --min-worker-port "${RAY_MIN_WORKER_PORT}" \
+      --max-worker-port "${RAY_MAX_WORKER_PORT}" \
+      --num-gpus "${NUM_GPUS}" \
+      --disable-usage-stats \
+      --dashboard-host=0.0.0.0 \
+      --dashboard-port "${RAY_DASHBOARD_PORT}" \
+      --temp-dir "${RAY_TEMP_DIR}"
+else
+   RAY_TEMP_DIR_OWNED=0
+   echo "Using external Ray job server: ${RAY_JOB_ADDRESS}"
+fi
 
 RUNTIME_ENV_JSON="{
   \"env_vars\": {
@@ -196,7 +313,10 @@ RUNTIME_ENV_JSON="{
   }
 }"
 
-ray job submit --address="http://127.0.0.1:8265" \
+RAY_JOB_ACTIVE=1
+set +e
+ray job submit --address="${RAY_JOB_ADDRESS}" \
+   --submission-id="${RAY_JOB_SUBMISSION_ID}" \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
    -- python3 train.py \
    --actor-num-nodes 1 \
@@ -216,3 +336,8 @@ ray job submit --address="http://127.0.0.1:8265" \
    "${SGLANG_ARGS[@]}" \
    "${MISC_ARGS[@]}" \
    "${CUSTOM_ARGS[@]}"
+
+RAY_JOB_STATUS=$?
+set -e
+RAY_JOB_ACTIVE=0
+exit "${RAY_JOB_STATUS}"
