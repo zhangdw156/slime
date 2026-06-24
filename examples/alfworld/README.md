@@ -1,6 +1,6 @@
-# ALFWorld GRPO / GRPO+OPSD / OPSD
+# ALFWorld GRPO / GRPO+OPSD / OPSD / SFT Distillation
 
-This example trains `Qwen2.5-3B-Instruct` with slime GRPO in the ALFWorld TextWorld environment, and can optionally add OPSD-style privileged teacher scoring on top of slime's native OPD advantage penalty. It also includes a pure OPSD launcher that zeros processed task rewards while keeping raw ALFWorld rewards for metrics. It uses `--rollout-function-path batched_rollout.generate_rollout` so one rollout batch can coordinate many active agent-environment episodes: model action requests are issued concurrently per environment step, and ALFWorld environment state is kept in Ray actors.
+This example trains `Qwen2.5-3B-Instruct` with slime GRPO in the ALFWorld TextWorld environment, and can optionally add OPSD-style privileged teacher scoring on top of slime's native OPD advantage penalty. It also includes a pure OPSD launcher that zeros processed task rewards while keeping raw ALFWorld rewards for metrics, plus a `Qwen2.5-0.5B-Instruct` SFT launcher for distilling successful 3B teacher trajectories into a smaller student. It uses `--rollout-function-path batched_rollout.generate_rollout` so one rollout batch can coordinate many active agent-environment episodes: model action requests are issued concurrently per environment step, and ALFWorld environment state is kept in Ray actors.
 
 The GRPO script is intended to reproduce the ALFWorld GRPO experiment from the SDAR paper [Self-Distilled Agentic Reinforcement Learning](https://arxiv.org/abs/2605.15155) by Meituan and Zhejiang University. The GRPO+OPSD script keeps the same ALFWorld rollout and reward path, but when `--use-opd --opd-type self` is enabled it scores each student step response under SDAR-style privileged ALFWorld skills on the current rollout SGLang router and passes `teacher_log_probs` to slime's existing OPD machinery. The pure OPSD script uses the same teacher-logprob path but sets processed training rewards to `0.0`, so the OPD term is the policy signal.
 
@@ -28,6 +28,19 @@ PYTHONPATH=/root/Megatron-LM python tools/convert_hf_to_torch_dist.py \
     ${MODEL_ARGS[@]} \
     --hf-checkpoint /root/Qwen2.5-3B-Instruct \
     --save /root/Qwen2.5-3B-Instruct_torch_dist
+```
+
+For the 0.5B SFT student launcher, also prepare the 0.5B checkpoint:
+
+```bash
+hf download Qwen/Qwen2.5-0.5B-Instruct --local-dir /root/Qwen2.5-0.5B-Instruct
+
+cd /root/slime
+source scripts/models/qwen2.5-0.5B.sh
+PYTHONPATH=/root/Megatron-LM python tools/convert_hf_to_torch_dist.py \
+    ${MODEL_ARGS[@]} \
+    --hf-checkpoint /root/Qwen2.5-0.5B-Instruct \
+    --save /root/Qwen2.5-0.5B-Instruct_torch_dist
 ```
 
 ## 3. Prepare ALFWorld game-index data
@@ -94,7 +107,57 @@ bash examples/alfworld/run_qwen2.5_3B_instruct_opsd.sh
 
 Both OPSD launchers default to `OPSD_TYPE=self` and `ALFWORLD_OPSD_SKILLS_DIR=examples/alfworld/skills`. In `self` mode they use the current rollout SGLang router as the teacher scorer with `max_new_tokens=0`, so no `--rm-url` or separately deployed teacher is required. To compare against an external SGLang teacher, set `OPSD_TYPE=sglang` and `ALFWORLD_OPSD_TEACHER_URL=http://teacher-host:port/generate`. The pure OPSD launcher does not enable `--use-kl-loss`, so it avoids an extra reference KL path.
 
-## 5. Run full valid_seen / valid_unseen evaluation only
+## 5. Build 3B teacher SFT data and train a 0.5B student
+
+After a 3B teacher checkpoint is available, expose it through an SGLang
+`/generate` endpoint and collect successful ALFWorld trajectories. The collector
+writes only reward-1 trajectories; the builder then keeps the shortest successful
+trajectory per task and emits one messages-format SFT row per usable step.
+
+```bash
+cd /root/slime
+python examples/alfworld/collect_teacher_trajectories.py \
+  --teacher-url http://127.0.0.1:30000/generate \
+  --tokenizer-path /root/Qwen2.5-3B-Instruct \
+  --task-file /root/slime-alfworld/train_games.jsonl \
+  --output-dir /root/slime-alfworld-teacher-sft \
+  --samples-per-task 4 \
+  --max-concurrent-tasks 128 \
+  --resume
+
+python examples/alfworld/build_sft_from_teacher_trajectories.py \
+  --input /root/slime-alfworld-teacher-sft/reward1_trajectories.jsonl \
+  --output /root/slime-alfworld-teacher-sft/alfworld_teacher_sft.jsonl \
+  --summary-output /root/slime-alfworld-teacher-sft/build_sft_summary.json
+```
+
+Then train the 0.5B student on the generated messages JSONL:
+
+```bash
+cd /root/slime
+bash examples/alfworld/run_qwen2.5_0.5B_instruct_sft.sh
+```
+
+Useful overrides:
+
+```bash
+NUM_GPUS=4 TP_SIZE=1 \
+SFT_DATA=/root/slime-alfworld-teacher-sft/alfworld_teacher_sft.jsonl \
+MODEL_ROOT=/root/Qwen2.5-0.5B-Instruct \
+MCORE_CKPT=/root/Qwen2.5-0.5B-Instruct_torch_dist \
+SLIME_CKPT=/root/Qwen2.5-0.5B-Instruct_alfworld_sft_slime \
+ALFWORLD_TASK_DIR=/root/slime-alfworld \
+USE_EVAL=1 EVAL_INTERVAL=10 \
+LOG_PROBS_CHUNK_SIZE=1024 \
+bash examples/alfworld/run_qwen2.5_0.5B_instruct_sft.sh
+```
+
+Set `USE_EVAL=0` to run training-only SFT with `--debug-train-only`, which
+skips SGLang rollout initialization. With `USE_EVAL=1`, the script evaluates the
+student on `valid_seen` and `valid_unseen` using the same `batched_rollout.py`
+path as the 3B GRPO launcher.
+
+## 6. Run full valid_seen / valid_unseen evaluation only
 
 Use the full-valid eval launcher when training-time eval used a small exported
 subset, such as 32 seen and 32 unseen games, but you want to score a saved
@@ -131,11 +194,35 @@ training. Metrics are logged under names such as
 default, matching the training launchers; set `USE_SWANLAB=0` to disable it,
 `USE_WANDB=1` to enable W&B, or `USE_TENSORBOARD=1` to enable TensorBoard.
 
+## Docker executable entrypoints
+
+Run these commands from the repository root inside the container, normally
+`/root/slime`. All launchers default to Docker-style `/root/...` paths and can
+be overridden with environment variables shown above.
+
+| Entrypoint | Command | Requires | Produces / does |
+| --- | --- | --- | --- |
+| `prepare_alfworld_data.py` | `python examples/alfworld/prepare_alfworld_data.py --alfworld-data /root/.cache/alfworld --local-dir /root/slime-alfworld` | ALFWorld data from `alfworld-download -f` | `train_games.jsonl`, `valid_seen_games.jsonl`, `valid_unseen_games.jsonl` |
+| `run_qwen2.5_3B_instruct_grpo.sh` | `bash examples/alfworld/run_qwen2.5_3B_instruct_grpo.sh` | 3B HF + torch_dist checkpoints, prepared game indices | GRPO checkpoint under `SLIME_CKPT` |
+| `run_qwen2.5_3B_instruct_grpo_opsd.sh` | `bash examples/alfworld/run_qwen2.5_3B_instruct_grpo_opsd.sh` | same as GRPO plus OPSD skills in `examples/alfworld/skills` | GRPO+OPSD checkpoint under `SLIME_CKPT` |
+| `run_qwen2.5_3B_instruct_opsd.sh` | `bash examples/alfworld/run_qwen2.5_3B_instruct_opsd.sh` | same as GRPO+OPSD | pure OPSD checkpoint under `SLIME_CKPT` |
+| `collect_teacher_trajectories.py` | `python examples/alfworld/collect_teacher_trajectories.py --teacher-url http://127.0.0.1:30000/generate --tokenizer-path /root/Qwen2.5-3B-Instruct --task-file /root/slime-alfworld/train_games.jsonl --output-dir /root/slime-alfworld-teacher-sft --resume` | running 3B teacher SGLang `/generate` endpoint and prepared train index | `reward1_trajectories.jsonl` |
+| `build_sft_from_teacher_trajectories.py` | `python examples/alfworld/build_sft_from_teacher_trajectories.py --input /root/slime-alfworld-teacher-sft/reward1_trajectories.jsonl --output /root/slime-alfworld-teacher-sft/alfworld_teacher_sft.jsonl` | collected reward-1 trajectories | messages-format SFT JSONL |
+| `run_qwen2.5_0.5B_instruct_sft.sh` | `bash examples/alfworld/run_qwen2.5_0.5B_instruct_sft.sh` | 0.5B HF + torch_dist checkpoints and SFT JSONL | SFT student checkpoint; optional ALFWorld eval when `USE_EVAL=1` |
+| `eval_qwen2.5_3B_instruct_full_valid.sh` | `bash examples/alfworld/eval_qwen2.5_3B_instruct_full_valid.sh` | trained 3B slime checkpoint and full ALFWorld data | full `valid_seen` / `valid_unseen` metrics |
+
+The remaining Python files in this directory (`batched_rollout.py`,
+`generate_with_alfworld.py`, `opsd.py`, `alfworld_env.py`, and `prompts.py`) are
+imported by the entrypoints above rather than launched directly.
+
 ## How the example works
 
 - `prepare_alfworld_data.py` scans `$ALFWORLD_DATA/json_2.1.1/{train,valid_seen,valid_unseen}` and keeps solvable `game.tw-pddl` tasks.
 - `batched_rollout.py` resets one `AlfredTWEnv` episode per trajectory in Ray actors, prompts the model with the current observation and admissible actions, parses `<think>...</think><action>...</action>`, steps all active environments in parallel, retires environment actors after a bounded number of episodes, and returns step-level slime `Sample` objects.
 - `generate_with_alfworld.py` keeps the single-episode fallback implementation plus shared reward/filter/helper functions used by the batched rollout path.
+- `collect_teacher_trajectories.py` samples actions from a running 3B teacher endpoint and records only successful raw ALFWorld trajectories for offline distillation.
+- `build_sft_from_teacher_trajectories.py` selects the shortest successful trajectory for each task and writes messages-format SFT rows consumed by the 0.5B SFT launcher.
+- `run_qwen2.5_0.5B_instruct_sft.sh` uses `slime.rollout.sft_rollout.generate_rollout` with `--loss-type sft_loss`; when `USE_EVAL=1`, it separately uses `batched_rollout.generate_rollout` for ALFWorld eval.
 - `opsd.py` mirrors SDAR's ALFWorld privileged skill selection and scores fixed student responses to populate `Sample.teacher_log_probs` when slime OPD is enabled. The default `--opd-type self` path scores on the current rollout router; `OPSD_TYPE=sglang` can point to an external teacher through `ALFWORLD_OPSD_TEACHER_URL`.
 - The reward is `1 * won - ALFWORLD_INVALID_ACTION_PENALTY * invalid_action_count`; the default invalid-action penalty is `0.01`.
 - `loss_mask` is `1` only on assistant-generated tokens and `0` on environment/user-observation tokens.
@@ -148,7 +235,10 @@ default, matching the training launchers; set `USE_SWANLAB=0` to disable it,
 | `run_qwen2.5_3B_instruct_grpo.sh` | slime launch script for Qwen2.5-3B-Instruct GRPO |
 | `run_qwen2.5_3B_instruct_grpo_opsd.sh` | GRPO launcher with OPSD teacher-logprob scoring enabled via slime OPD |
 | `run_qwen2.5_3B_instruct_opsd.sh` | pure OPSD launcher with zero processed rewards and no GRPO reward-std filter |
+| `run_qwen2.5_0.5B_instruct_sft.sh` | SFT launcher for distilling 3B teacher ALFWorld data into Qwen2.5-0.5B-Instruct |
 | `eval_qwen2.5_3B_instruct_full_valid.sh` | eval-only launcher that regenerates full valid_seen/valid_unseen indices and logs full-split metrics |
+| `collect_teacher_trajectories.py` | collects reward-1 trajectories from a running 3B teacher endpoint |
+| `build_sft_from_teacher_trajectories.py` | converts successful teacher trajectories into messages-format SFT data |
 | `batched_rollout.py` | custom batched ALFWorld rollout function used by `--rollout-function-path` |
 | `opsd.py` | SDAR-style privileged skill loading and teacher log-prob scoring helpers |
 | `skills/` | ALFWorld privileged skill mapping and markdown copied from SDAR runtime skills |

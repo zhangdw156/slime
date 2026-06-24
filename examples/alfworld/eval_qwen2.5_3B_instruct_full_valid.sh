@@ -266,6 +266,7 @@ CUSTOM_ARGS=(
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 RAY_DASHBOARD_PORT=${RAY_DASHBOARD_PORT:-8265}
 RAY_TEMP_DIR=${RAY_TEMP_DIR:-/root/shared/ray_temp}
+mkdir -p "${RAY_TEMP_DIR}"
 ray start --head --node-ip-address "${MASTER_ADDR}" --num-gpus "${NUM_GPUS}" --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port="${RAY_DASHBOARD_PORT}" --temp-dir "${RAY_TEMP_DIR}"
 
 RUNTIME_ENV_JSON="{

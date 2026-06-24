@@ -45,6 +45,24 @@ export ALFWORLD_INVALID_ACTION_PENALTY=${ALFWORLD_INVALID_ACTION_PENALTY:-0.01}
 export ALFWORLD_ENV_WORKER_CPUS=${ALFWORLD_ENV_WORKER_CPUS:-0.1}
 export ALFWORLD_ENV_WORKER_MAX_EPISODES=${ALFWORLD_ENV_WORKER_MAX_EPISODES:-1}
 
+
+require_path() {
+   local path="$1"
+   local desc="$2"
+   if [[ ! -e "${path}" ]]; then
+      echo "ERROR: missing ${desc}: ${path}" >&2
+      exit 2
+   fi
+}
+
+require_path "${MODEL_ROOT}" "HF model root"
+require_path "${MCORE_CKPT}" "Megatron torch_dist checkpoint"
+require_path "${ALFWORLD_CONFIG_PATH}" "ALFWorld config"
+require_path "${ALFWORLD_TASK_DIR}/train_games.jsonl" "ALFWorld train game index"
+require_path "${ALFWORLD_TASK_DIR}/valid_seen_games.jsonl" "ALFWorld valid_seen game index"
+require_path "${ALFWORLD_TASK_DIR}/valid_unseen_games.jsonl" "ALFWorld valid_unseen game index"
+mkdir -p "${SLIME_CKPT}"
+
 ROLLOUT_BATCH_SIZE=${ROLLOUT_BATCH_SIZE:-16}
 N_SAMPLES_PER_PROMPT=${N_SAMPLES_PER_PROMPT:-8}
 GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-$((ROLLOUT_BATCH_SIZE * N_SAMPLES_PER_PROMPT))}
@@ -172,7 +190,9 @@ CUSTOM_ARGS=(
 )
 
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
-ray start --head --node-ip-address "${MASTER_ADDR}" --num-gpus "${NUM_GPUS}" --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265 --temp-dir /root/shared/ray_temp
+RAY_TEMP_DIR=${RAY_TEMP_DIR:-/root/shared/ray_temp}
+mkdir -p "${RAY_TEMP_DIR}"
+ray start --head --node-ip-address "${MASTER_ADDR}" --num-gpus "${NUM_GPUS}" --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265 --temp-dir "${RAY_TEMP_DIR}"
 
 RUNTIME_ENV_JSON="{
   \"env_vars\": {

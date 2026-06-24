@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Build step-level SFT data from raw reward-1 ALFWorld teacher trajectories.
 
 The collector keeps every trajectory whose environment reward is 1. This script

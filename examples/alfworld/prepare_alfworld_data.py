@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Prepare ALFWorld game-file JSONL indices for slime training/evaluation.
 
 Each output row is intentionally lightweight: slime reads `index` as the prompt

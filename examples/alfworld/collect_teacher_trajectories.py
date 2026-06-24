@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Collect reward-1 ALFWorld teacher trajectories for offline SFT distillation.
 
 This collector mirrors the batched ALFWorld rollout structure used during
