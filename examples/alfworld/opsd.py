@@ -20,6 +20,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+from native_opd import annotate_native_opd_teacher_log_probs, native_opd_enabled
 from slime.utils.http_utils import post
 from slime.utils.types import Sample
 
@@ -247,8 +248,12 @@ async def score_sample_teacher_log_probs(
 
 
 async def annotate_opsd_teacher_log_probs(args: Any, tokenizer: Any, samples: list[Sample]) -> None:
-    """Populate ``Sample.teacher_log_probs`` for train samples when OPSD is enabled."""
+    """Populate ``Sample.teacher_log_probs`` for ALFWorld OPD/OPSD train samples."""
     if not opsd_enabled(args) or not samples:
+        return
+
+    if native_opd_enabled(args):
+        await annotate_native_opd_teacher_log_probs(args, samples)
         return
 
     provider = get_skill_provider()

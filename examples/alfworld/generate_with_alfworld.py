@@ -480,13 +480,18 @@ def grpo_normalize_alfworld_steps(args, samples: list[Sample]) -> tuple[list[flo
     return raw_rewards, processed
 
 
-def zero_alfworld_rewards_for_opsd(args, samples: list[Sample]) -> tuple[list[float], list[float]]:
+def zero_alfworld_rewards_for_opd(args, samples: list[Sample]) -> tuple[list[float], list[float]]:
     """Return zero training rewards while preserving ALFWorld raw rewards.
 
-    This is the reward post-process hook for pure OPSD runs.  The environment
-    reward remains in ``raw_reward`` for logging/pass-rate metrics, but the
-    processed reward consumed by the advantage estimator is zero so the policy
-    gradient comes from slime's OPD advantage penalty.
+    This is the reward post-process hook for pure OPD-style runs. The
+    environment reward remains in ``raw_reward`` for logging/pass-rate metrics,
+    but the processed reward consumed by the advantage estimator is zero so the
+    policy gradient comes from slime's OPD advantage penalty.
     """
     raw_rewards = [sample.get_reward_value(args) for sample in samples]
     return raw_rewards, [0.0] * len(samples)
+
+
+def zero_alfworld_rewards_for_opsd(args, samples: list[Sample]) -> tuple[list[float], list[float]]:
+    """Backward-compatible alias for older ALFWorld OPSD launchers."""
+    return zero_alfworld_rewards_for_opd(args, samples)

@@ -157,6 +157,35 @@ skips SGLang rollout initialization. With `USE_EVAL=1`, the script evaluates the
 student on `valid_seen` and `valid_unseen` using the same `batched_rollout.py`
 path as the 3B GRPO launcher.
 
+### Native OPD: train a 0.5B student from a trained 3B teacher
+
+If you want slime's framework-native OPD path instead of the ALFWorld
+privileged-skill OPSD prompt, first deploy the trained 3B teacher as an SGLang
+`/generate` endpoint, then launch the 0.5B student script with `TEACHER_URL`
+pointing to that endpoint:
+
+```bash
+python3 -m sglang.launch_server \
+  --model-path /root/Qwen2.5-3B-Instruct-alfworld-teacher \
+  --host 0.0.0.0 \
+  --port 30000
+
+cd /root/slime
+bash examples/alfworld/run_qwen2.5_0.5B_instruct_opd_from_3B.sh
+```
+
+Override `TEACHER_URL`, `MODEL_ROOT`, or `MCORE_CKPT` only when your paths or
+teacher endpoint differ from the script defaults. The native OPD launcher
+defaults to one rollout per prompt (`N_SAMPLES_PER_PROMPT=1`); increase it only
+if you want multiple student trajectories per ALFWorld task. This launcher sets
+`ALFWORLD_OPD_USE_NATIVE=1`, uses
+`--use-opd --opd-type sglang --rm-url "$TEACHER_URL"`, and reuses
+`slime.rollout.on_policy_distillation.reward_func` to score the 0.5B
+student's online ALFWorld action tokens under the 3B teacher. It keeps raw
+ALFWorld rewards for metrics but returns zero processed training rewards, so
+the policy signal is the native OPD term. Unlike the `_opsd.sh` launchers, this
+path does not prepend ALFWorld privileged skill text to the teacher prompt.
+
 ## 6. Run full valid_seen / valid_unseen evaluation only
 
 Use the full-valid eval launcher when training-time eval used a small exported
@@ -209,6 +238,7 @@ be overridden with environment variables shown above.
 | `collect_teacher_trajectories.py` | `python examples/alfworld/collect_teacher_trajectories.py --teacher-url http://127.0.0.1:30000/generate --tokenizer-path /root/Qwen2.5-3B-Instruct --task-file /root/slime-alfworld/train_games.jsonl --output-dir /root/slime-alfworld-teacher-sft --resume` | running 3B teacher SGLang `/generate` endpoint and prepared train index | `reward1_trajectories.jsonl` |
 | `build_sft_from_teacher_trajectories.py` | `python examples/alfworld/build_sft_from_teacher_trajectories.py --input /root/slime-alfworld-teacher-sft/reward1_trajectories.jsonl --output /root/slime-alfworld-teacher-sft/alfworld_teacher_sft.jsonl` | collected reward-1 trajectories | messages-format SFT JSONL |
 | `run_qwen2.5_0.5B_instruct_sft.sh` | `bash examples/alfworld/run_qwen2.5_0.5B_instruct_sft.sh` | 0.5B HF + torch_dist checkpoints and SFT JSONL | SFT student checkpoint; optional ALFWorld eval when `USE_EVAL=1` |
+| `run_qwen2.5_0.5B_instruct_opd_from_3B.sh` | `bash examples/alfworld/run_qwen2.5_0.5B_instruct_opd_from_3B.sh` | 0.5B HF + torch_dist checkpoints, prepared game indices, trained 3B SGLang `/generate` endpoint | Native slime OPD training of the 0.5B student from the 3B teacher |
 | `eval_qwen2.5_3B_instruct_full_valid.sh` | `bash examples/alfworld/eval_qwen2.5_3B_instruct_full_valid.sh` | trained 3B slime checkpoint and full ALFWorld data | full `valid_seen` / `valid_unseen` metrics |
 
 The remaining Python files in this directory (`batched_rollout.py`,
@@ -236,6 +266,7 @@ imported by the entrypoints above rather than launched directly.
 | `run_qwen2.5_3B_instruct_grpo_opsd.sh` | GRPO launcher with OPSD teacher-logprob scoring enabled via slime OPD |
 | `run_qwen2.5_3B_instruct_opsd.sh` | pure OPSD launcher with zero processed rewards and no GRPO reward-std filter |
 | `run_qwen2.5_0.5B_instruct_sft.sh` | SFT launcher for distilling 3B teacher ALFWorld data into Qwen2.5-0.5B-Instruct |
+| `run_qwen2.5_0.5B_instruct_opd_from_3B.sh` | native slime OPD launcher for online ALFWorld 0.5B rollouts scored by a trained 3B SGLang teacher |
 | `eval_qwen2.5_3B_instruct_full_valid.sh` | eval-only launcher that regenerates full valid_seen/valid_unseen indices and logs full-split metrics |
 | `collect_teacher_trajectories.py` | collects reward-1 trajectories from a running 3B teacher endpoint |
 | `build_sft_from_teacher_trajectories.py` | converts successful teacher trajectories into messages-format SFT data |
