@@ -94,6 +94,43 @@ bash examples/alfworld/run_qwen2.5_3B_instruct_opsd.sh
 
 Both OPSD launchers default to `OPSD_TYPE=self` and `ALFWORLD_OPSD_SKILLS_DIR=examples/alfworld/skills`. In `self` mode they use the current rollout SGLang router as the teacher scorer with `max_new_tokens=0`, so no `--rm-url` or separately deployed teacher is required. To compare against an external SGLang teacher, set `OPSD_TYPE=sglang` and `ALFWORLD_OPSD_TEACHER_URL=http://teacher-host:port/generate`. The pure OPSD launcher does not enable `--use-kl-loss`, so it avoids an extra reference KL path.
 
+## 5. Run full valid_seen / valid_unseen evaluation only
+
+Use the full-valid eval launcher when training-time eval used a small exported
+subset, such as 32 seen and 32 unseen games, but you want to score a saved
+checkpoint on the full ALFWorld `valid_seen` and `valid_unseen` splits. The
+launcher regenerates separate full-eval JSONL indices from `$ALFWORLD_DATA` and
+does not overwrite the training/eval files under `ALFWORLD_TASK_DIR`.
+
+```bash
+cd /root/slime
+MODEL_ROOT=/root/Qwen2.5-3B-Instruct \
+SLIME_CKPT=/root/Qwen2.5-3B-Instruct_alfworld_grpo_slime \
+ALFWORLD_DATA=/root/.cache/alfworld \
+ALFWORLD_FULL_EVAL_TASK_DIR=/root/slime-alfworld-full-eval \
+bash examples/alfworld/eval_qwen2.5_3B_instruct_full_valid.sh
+```
+
+By default the script loads the latest checkpoint recorded by
+`latest_checkpointed_iteration.txt`. To evaluate a specific saved checkpoint,
+set `CKPT_STEP`; for example, `CKPT_STEP=50` loads `iter_0000050` from
+`SLIME_CKPT`:
+
+```bash
+CKPT_STEP=50 \
+SLIME_CKPT=/root/Qwen2.5-3B-Instruct_alfworld_grpo_slime \
+bash examples/alfworld/eval_qwen2.5_3B_instruct_full_valid.sh
+```
+
+The script runs slime in eval-only mode with `--num-rollout 0` and
+`--eval-interval 1`, so it initializes the model and rollout servers, syncs the
+selected checkpoint to SGLang, runs one full evaluation, and exits without
+training. Metrics are logged under names such as
+`eval/valid_seen_full/alfworld/success_rate` and
+`eval/valid_unseen_full/alfworld/success_rate`. SwanLab logging is enabled by
+default, matching the training launchers; set `USE_SWANLAB=0` to disable it,
+`USE_WANDB=1` to enable W&B, or `USE_TENSORBOARD=1` to enable TensorBoard.
+
 ## How the example works
 
 - `prepare_alfworld_data.py` scans `$ALFWORLD_DATA/json_2.1.1/{train,valid_seen,valid_unseen}` and keeps solvable `game.tw-pddl` tasks.
@@ -111,6 +148,7 @@ Both OPSD launchers default to `OPSD_TYPE=self` and `ALFWORLD_OPSD_SKILLS_DIR=ex
 | `run_qwen2.5_3B_instruct_grpo.sh` | slime launch script for Qwen2.5-3B-Instruct GRPO |
 | `run_qwen2.5_3B_instruct_grpo_opsd.sh` | GRPO launcher with OPSD teacher-logprob scoring enabled via slime OPD |
 | `run_qwen2.5_3B_instruct_opsd.sh` | pure OPSD launcher with zero processed rewards and no GRPO reward-std filter |
+| `eval_qwen2.5_3B_instruct_full_valid.sh` | eval-only launcher that regenerates full valid_seen/valid_unseen indices and logs full-split metrics |
 | `batched_rollout.py` | custom batched ALFWorld rollout function used by `--rollout-function-path` |
 | `opsd.py` | SDAR-style privileged skill loading and teacher log-prob scoring helpers |
 | `skills/` | ALFWorld privileged skill mapping and markdown copied from SDAR runtime skills |
