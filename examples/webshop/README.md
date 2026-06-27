@@ -74,7 +74,7 @@ Important launcher defaults:
 - `GLOBAL_BATCH_SIZE=128`
 - `NUM_ROLLOUT=150`
 - `EVAL_INTERVAL=5`, with eval before train enabled by slime default
-- rollout internals follow SDAR WebShop defaults: `max_steps=15`, `history_length=2`, per-step generation cap `512`, history fallback threshold `13000` chars, invalid-action penalty `0.1` on the invalid step
+- rollout internals use `max_steps=15`, `history_length=4` (override with `WEBSHOP_HISTORY_LENGTH`), per-step generation cap `512`, history fallback threshold `13000` chars, invalid-action penalty `0.1` on the invalid step
 - `MAX_TOKENS_PER_GPU=32768`
 - `LOG_PROBS_CHUNK_SIZE=8192`
 - eval samples per prompt `1`, temperature `0.4`, top-p `1.0`

@@ -8,6 +8,7 @@ WebShop's heavier dependencies live in the service environment.
 from __future__ import annotations
 
 import logging
+import os
 import uuid
 from collections import defaultdict
 from collections.abc import Iterable
@@ -29,10 +30,18 @@ from slime.utils.types import Sample
 logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_STEPS = 15
-DEFAULT_HISTORY_LENGTH = 2
+DEFAULT_HISTORY_LENGTH = 4
 DEFAULT_STEP_MAX_TOKENS = 512
 DEFAULT_MAX_PROMPT_CHARS = 13000
 DEFAULT_INVALID_ACTION_PENALTY = 0.1
+
+
+def _get_int_env(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, default))
+    except ValueError:
+        logger.warning("Invalid integer for %s=%r; using %s", name, os.environ.get(name), default)
+        return default
 
 
 def _get_metadata(sample: Sample) -> dict[str, Any]:
@@ -212,7 +221,7 @@ async def generate(
         sample.session_id = str(uuid.uuid4())
 
     max_steps = DEFAULT_MAX_STEPS
-    history_length = DEFAULT_HISTORY_LENGTH
+    history_length = _get_int_env("WEBSHOP_HISTORY_LENGTH", DEFAULT_HISTORY_LENGTH)
     step_max_tokens = DEFAULT_STEP_MAX_TOKENS
     max_prompt_chars = DEFAULT_MAX_PROMPT_CHARS
     invalid_action_penalty = DEFAULT_INVALID_ACTION_PENALTY
