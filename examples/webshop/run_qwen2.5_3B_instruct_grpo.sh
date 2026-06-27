@@ -22,30 +22,21 @@ export MKL_NUM_THREADS=${MKL_NUM_THREADS:-1}
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
 
 NVLINK_COUNT=$(nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l)
-if [ "${NVLINK_COUNT}" -gt 0 ]; then
+if [ "$NVLINK_COUNT" -gt 0 ]; then
     HAS_NVLINK=1
 else
     HAS_NVLINK=0
 fi
-echo "HAS_NVLINK: ${HAS_NVLINK} (detected ${NVLINK_COUNT} NVLink references)"
+echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
-SLIME_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-source "${SLIME_ROOT}/scripts/models/qwen2.5-3B.sh"
+source "${SCRIPT_DIR}/../../scripts/models/qwen2.5-3B.sh"
 
 MODEL_ROOT=${MODEL_ROOT:-/root/Qwen2.5-3B-Instruct}
 MCORE_CKPT=${MCORE_CKPT:-/root/Qwen2.5-3B-Instruct_torch_dist}
 SLIME_CKPT=${SLIME_CKPT:-/root/Qwen2.5-3B-Instruct_webshop_grpo_slime}
 WEBSHOP_TASK_DIR=${WEBSHOP_TASK_DIR:-/root/slime-webshop}
 export WEBSHOP_SERVICE_URL=${WEBSHOP_SERVICE_URL:-http://127.0.0.1:3001}
-export WEBSHOP_MAX_STEPS=${WEBSHOP_MAX_STEPS:-30}
-export WEBSHOP_HISTORY_LENGTH=${WEBSHOP_HISTORY_LENGTH:-4}
-export WEBSHOP_STEP_MAX_TOKENS=${WEBSHOP_STEP_MAX_TOKENS:-256}
-export WEBSHOP_MAX_PROMPT_CHARS=${WEBSHOP_MAX_PROMPT_CHARS:-12000}
-export WEBSHOP_INVALID_ACTION_PENALTY=${WEBSHOP_INVALID_ACTION_PENALTY:-0.0}
-export WEBSHOP_CLOSE_SESSION_ON_DONE=${WEBSHOP_CLOSE_SESSION_ON_DONE:-1}
-export WEBSHOP_HTTP_RETRIES=${WEBSHOP_HTTP_RETRIES:-10}
-export WEBSHOP_OBSERVATION_MODE=${WEBSHOP_OBSERVATION_MODE:-text}
 
 require_path() {
    local path="$1"
@@ -60,7 +51,6 @@ check_webshop_service() {
    python3 - <<'PY'
 import json
 import os
-import sys
 import urllib.request
 
 url = os.environ["WEBSHOP_SERVICE_URL"].rstrip("/") + "/health"
@@ -74,6 +64,9 @@ if not payload.get("ok"):
 goals = int(payload.get("goal_count", payload.get("goals", 0)))
 if goals <= 0:
     raise SystemExit(f"ERROR: WebShop service has no goals: {payload}")
+expected = 6910
+if goals != expected:
+    raise SystemExit(f"ERROR: expected {expected} WebShop small synthetic goals, got {goals}: {payload}")
 print(json.dumps({"webshop_service": url, "goals": goals, "sessions": payload.get("sessions")}, indent=2))
 PY
 }
@@ -81,20 +74,20 @@ PY
 require_path "${MODEL_ROOT}" "HF model root"
 require_path "${MCORE_CKPT}" "Megatron torch_dist checkpoint"
 require_path "${WEBSHOP_TASK_DIR}/train.jsonl" "WebShop train goal index"
-require_path "${WEBSHOP_TASK_DIR}/valid_seen.jsonl" "WebShop valid_seen goal index"
-require_path "${WEBSHOP_TASK_DIR}/valid_unseen.jsonl" "WebShop valid_unseen goal index"
+require_path "${WEBSHOP_TASK_DIR}/valid.jsonl" "WebShop validation goal index"
 check_webshop_service
 mkdir -p "${SLIME_CKPT}"
 
-ROLLOUT_BATCH_SIZE=${ROLLOUT_BATCH_SIZE:-8}
+ROLLOUT_BATCH_SIZE=${ROLLOUT_BATCH_SIZE:-16}
 N_SAMPLES_PER_PROMPT=${N_SAMPLES_PER_PROMPT:-8}
 GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-$((ROLLOUT_BATCH_SIZE * N_SAMPLES_PER_PROMPT))}
-NUM_ROLLOUT=${NUM_ROLLOUT:-200}
-NUM_GPUS=${NUM_GPUS:-4}
+NUM_ROLLOUT=${NUM_ROLLOUT:-150}
+NUM_GPUS=${NUM_GPUS:-2}
 TP_SIZE=${TP_SIZE:-1}
-MAX_TOKENS_PER_GPU=${MAX_TOKENS_PER_GPU:-12288}
+MAX_TOKENS_PER_GPU=${MAX_TOKENS_PER_GPU:-32768}
+LOG_PROBS_CHUNK_SIZE=${LOG_PROBS_CHUNK_SIZE:-8192}
 SAVE_INTERVAL=${SAVE_INTERVAL:-10}
-EVAL_INTERVAL=${EVAL_INTERVAL:-10}
+EVAL_INTERVAL=${EVAL_INTERVAL:-5}
 
 CKPT_ARGS=(
    --hf-checkpoint "${MODEL_ROOT}/"
@@ -103,19 +96,15 @@ CKPT_ARGS=(
    --save "${SLIME_CKPT}/"
    --save-interval "${SAVE_INTERVAL}"
 )
-
 ROLLOUT_ARGS=(
    --prompt-data "${WEBSHOP_TASK_DIR}/train.jsonl"
    --input-key text
    --metadata-key metadata
-   --rollout-shuffle
    --num-rollout "${NUM_ROLLOUT}"
    --rollout-batch-size "${ROLLOUT_BATCH_SIZE}"
    --n-samples-per-prompt "${N_SAMPLES_PER_PROMPT}"
-   --rollout-max-response-len "${WEBSHOP_STEP_MAX_TOKENS}"
    --rollout-temperature 1
    --global-batch-size "${GLOBAL_BATCH_SIZE}"
-   --dynamic-sampling-filter-path generate_with_webshop.check_episode_reward_nonzero_std
    --custom-reward-post-process-path generate_with_webshop.grpo_normalize_webshop_steps
    --custom-rollout-log-function-path generate_with_webshop.log_webshop_rollout
    --balance-data
@@ -123,10 +112,10 @@ ROLLOUT_ARGS=(
 
 EVAL_ARGS=(
    --eval-interval "${EVAL_INTERVAL}"
-   --eval-prompt-data valid_seen "${WEBSHOP_TASK_DIR}/valid_seen.jsonl" valid_unseen "${WEBSHOP_TASK_DIR}/valid_unseen.jsonl"
+   --eval-prompt-data valid "${WEBSHOP_TASK_DIR}/valid.jsonl"
    --n-samples-per-eval-prompt 1
-   --eval-max-response-len "${WEBSHOP_STEP_MAX_TOKENS}"
-   --eval-top-k 1
+   --eval-temperature 0.4
+   --eval-top-p 1.0
 )
 
 PERF_ARGS=(
@@ -141,6 +130,7 @@ PERF_ARGS=(
    --recompute-num-layers 1
    --use-dynamic-batch-size
    --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU}"
+   --log-probs-chunk-size "${LOG_PROBS_CHUNK_SIZE}"
 )
 
 GRPO_ARGS=(
@@ -165,7 +155,7 @@ OPTIMIZER_ARGS=(
 WANDB_ARGS=(
    # --use-wandb
    # --wandb-project slime-webshop
-   # --wandb-group qwen2.5-3B-instruct
+   # --wandb-group Qwen2.5-3B-Instruct
    # --wandb-key ${WANDB_KEY}
 )
 
@@ -173,8 +163,8 @@ SWANLAB_ARGS=(
    --use-swanlab
    --swanlab-mode "${SWANLAB_MODE:-cloud}"
    --swanlab-project "${SWANLAB_PROJECT:-slime-webshop}"
-   --swanlab-group "${SWANLAB_GROUP:-qwen2.5-3B-instruct}"
-   --swanlab-experiment-name "${SWANLAB_EXPERIMENT_NAME:-qwen2.5-3B-instruct-webshop-grpo}"
+   --swanlab-group "${SWANLAB_GROUP:-Qwen2.5-3B-Instruct}"
+   --swanlab-experiment-name "${SWANLAB_EXPERIMENT_NAME:-Qwen2.5-3B-Instruct-grpo}"
    --disable-swanlab-random-suffix
 )
 
@@ -199,7 +189,7 @@ fi
 
 SGLANG_ARGS=(
    --rollout-num-gpus-per-engine 1
-   --sglang-mem-fraction-static 0.7
+   --sglang-mem-fraction-static 0.6
    # WebShop is an external environment; reduce this if the service becomes the bottleneck.
    # --sglang-server-concurrency 32
 )
@@ -218,29 +208,19 @@ CUSTOM_ARGS=(
 )
 
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
-RAY_TEMP_DIR=${RAY_TEMP_DIR:-/root/shared/ray_temp_webshop}
-RAY_PORT=${RAY_PORT:-6379}
-RAY_DASHBOARD_PORT=${RAY_DASHBOARD_PORT:-8265}
+RAY_TEMP_DIR=${RAY_TEMP_DIR:-/root/shared/ray_temp}
 mkdir -p "${RAY_TEMP_DIR}"
-ray start --head --node-ip-address "${MASTER_ADDR}" --port "${RAY_PORT}" --num-gpus "${NUM_GPUS}" --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port="${RAY_DASHBOARD_PORT}" --temp-dir "${RAY_TEMP_DIR}"
+ray start --head --node-ip-address "${MASTER_ADDR}" --num-gpus "${NUM_GPUS}" --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265 --temp-dir "${RAY_TEMP_DIR}"
 
 RUNTIME_ENV_JSON="{
   \"env_vars\": {
-    \"PYTHONPATH\": \"/root/Megatron-LM/:${SCRIPT_DIR}:${SLIME_ROOT}\",
+    \"PYTHONPATH\": \"/root/Megatron-LM/:${SCRIPT_DIR}\",
     \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
-    \"WEBSHOP_SERVICE_URL\": \"${WEBSHOP_SERVICE_URL}\",
-    \"WEBSHOP_MAX_STEPS\": \"${WEBSHOP_MAX_STEPS}\",
-    \"WEBSHOP_HISTORY_LENGTH\": \"${WEBSHOP_HISTORY_LENGTH}\",
-    \"WEBSHOP_STEP_MAX_TOKENS\": \"${WEBSHOP_STEP_MAX_TOKENS}\",
-    \"WEBSHOP_MAX_PROMPT_CHARS\": \"${WEBSHOP_MAX_PROMPT_CHARS}\",
-    \"WEBSHOP_INVALID_ACTION_PENALTY\": \"${WEBSHOP_INVALID_ACTION_PENALTY}\",
-    \"WEBSHOP_CLOSE_SESSION_ON_DONE\": \"${WEBSHOP_CLOSE_SESSION_ON_DONE}\",
-    \"WEBSHOP_HTTP_RETRIES\": \"${WEBSHOP_HTTP_RETRIES}\",
-    \"WEBSHOP_OBSERVATION_MODE\": \"${WEBSHOP_OBSERVATION_MODE}\"
+    \"WEBSHOP_SERVICE_URL\": \"${WEBSHOP_SERVICE_URL}\"
   }
 }"
 
-ray job submit --address="http://127.0.0.1:${RAY_DASHBOARD_PORT}" \
+ray job submit --address="http://127.0.0.1:8265" \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
    -- python3 train.py \
    --actor-num-nodes 1 \

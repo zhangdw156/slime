@@ -19,29 +19,24 @@ def get_webshop_service_url() -> str:
     return os.environ.get("WEBSHOP_SERVICE_URL", DEFAULT_WEBSHOP_SERVICE_URL).rstrip("/")
 
 
-def get_webshop_http_retries() -> int:
-    try:
-        return int(os.environ.get("WEBSHOP_HTTP_RETRIES", "10"))
-    except ValueError:
-        logger.warning("Invalid WEBSHOP_HTTP_RETRIES=%r; using 10", os.environ.get("WEBSHOP_HTTP_RETRIES"))
-        return 10
-
-
 async def reset_session(
     *,
     session_id: str,
     goal_idx: int | None = None,
+    goal_seed: int | None = None,
     observation_mode: str | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {"session_id": session_id}
     if goal_idx is not None:
         payload["goal_idx"] = int(goal_idx)
+    if goal_seed is not None:
+        payload["goal_seed"] = int(goal_seed)
     if observation_mode is not None:
         payload["observation_mode"] = observation_mode
     return await post(
         f"{get_webshop_service_url()}/v1/reset",
         payload,
-        max_retries=get_webshop_http_retries(),
+        max_retries=10,
     )
 
 
@@ -49,7 +44,7 @@ async def step_session(*, session_id: str, action: str) -> dict[str, Any]:
     return await post(
         f"{get_webshop_service_url()}/v1/step",
         {"session_id": session_id, "action": action},
-        max_retries=get_webshop_http_retries(),
+        max_retries=10,
     )
 
 

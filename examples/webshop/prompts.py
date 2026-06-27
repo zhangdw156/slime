@@ -174,27 +174,3 @@ def parse_action(response: str, available_actions: dict) -> ParsedAction:
         valid_admissible=valid_admissible,
         invalid_reason=invalid_reason,
     )
-
-
-def fallback_search_query(instruction_text: str) -> str:
-    cleaned = re.sub(r"[^a-zA-Z0-9 ]+", " ", instruction_text).lower()
-    words = [word for word in cleaned.split() if word not in {"i", "want", "need", "find", "buy", "a", "an", "the"}]
-    return " ".join(words[:8]) or "product"
-
-
-def safe_action_for_service(parsed: ParsedAction, available_actions: dict, instruction_text: str) -> str:
-    if parsed.is_valid:
-        return parsed.action
-    if available_actions.get("has_search_bar"):
-        return f"search[{fallback_search_query(instruction_text)}]"
-
-    clickables = [normalize_clickable(item) for item in available_actions.get("clickables", [])]
-    for preferred in ("back to search", "< prev", "description", "features", "reviews"):
-        if preferred in clickables:
-            return f"click[{preferred}]"
-    for clickable in clickables:
-        if clickable and clickable not in {"search", "buy now"}:
-            return f"click[{clickable}]"
-    if "buy now" in clickables:
-        return "click[buy now]"
-    return "click[back to search]"

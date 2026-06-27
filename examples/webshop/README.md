@@ -1,59 +1,62 @@
 # WebShop GRPO example
 
-This example trains `Qwen2.5-3B-Instruct` with slime GRPO against a separately deployed WebShop HTTP service. WebShop's heavier runtime dependencies stay in the service repo; slime workers only use the thin HTTP client in this directory.
+This example trains `Qwen2.5-3B-Instruct` with slime GRPO against a separately deployed WebShop HTTP service. The defaults target the WebShop small synthetic setup: `env_seed=0`, `max_steps=15`, train pool `goal_idx >= 500`, validation pool `goal_idx < 500`, `train_batch_size=16`, `rollout.n=8`, `val_batch_size=128`, `test_freq=5`, and `total_epochs=150`.
 
 ## Files
 
 | File | Purpose |
 | --- | --- |
 | `client.py` | Async client for the WebShop HTTP service. |
-| `prompts.py` | Prompt template, action parser, and safe fallback action logic. |
-| `generate_with_webshop.py` | Custom slime generation function, dynamic filter, GRPO reward normalization, rollout/eval metrics. |
-| `prepare_webshop_data.py` | Builds lightweight `train.jsonl`, `valid_seen.jsonl`, and `valid_unseen.jsonl` goal-index files. |
-| `run_qwen2.5_3B_instruct_grpo.sh` | Formal Qwen2.5-3B-Instruct GRPO launcher. |
+| `prompts.py` | Prompt template and action parser. |
+| `generate_with_webshop.py` | Custom slime generation function, GRPO reward normalization, rollout/eval metrics. |
+| `prepare_webshop_data.py` | Builds lightweight WebShop goal metadata JSONL files: `train.jsonl` and `valid.jsonl`. |
+| `run_qwen2.5_3B_instruct_grpo.sh` | Qwen2.5-3B-Instruct GRPO launcher with WebShop small synthetic defaults. |
 
 ## 1. Start the WebShop service
 
-In the WebShop service repo after completing the normal WebShop data/index setup:
+In the modified WebShop service repo after completing the normal small data/index setup:
 
 ```bash
-PORT=3001 NUM_PRODUCTS=1000 ./run_webshop_service.sh
+cd ../WebShop
+./setup.sh -d small
+PORT=3001 SEED=0 ./run_webshop_service.sh
 ```
 
 Useful service endpoints:
 
 - `GET /health`
 - `GET /v1/goals?limit=0`
-- `POST /v1/reset`
+- `GET /v1/goals?goal_seed=7&limit=5`
+- `POST /v1/reset` with optional `goal_idx`, `goal_seed`, `observation_mode`
 - `POST /v1/step`
 - `DELETE /v1/session/<session_id>`
 
-If Ray workers run on a different host/container from the service, set `WEBSHOP_SERVICE_URL` to a reachable host/IP instead of `127.0.0.1`.
+Check the small synthetic pool:
+
+```bash
+curl -s 'http://127.0.0.1:3001/v1/goals?limit=0' | jq
+```
+
+The expected small synthetic setup reports `goal_count: 6910`.
 
 ## 2. Prepare slime prompt data
 
-Generate stable WebShop goal-index JSONL files:
-
 ```bash
+cd ../slime
 python examples/webshop/prepare_webshop_data.py \
   --service-url http://127.0.0.1:3001 \
-  --output-dir /root/slime-webshop \
-  --shuffle
+  --output-dir /root/slime-webshop
 ```
 
-This writes:
+This writes the fixed slime WebShop task schedule:
 
-- `/root/slime-webshop/train.jsonl`
-- `/root/slime-webshop/valid_seen.jsonl`
-- `/root/slime-webshop/valid_unseen.jsonl`
-- `/root/slime-webshop/all.jsonl`
-- `/root/slime-webshop/summary.json`
+- `/root/slime-webshop/train.jsonl` — 150 rollout batches × 16 prompt groups; metadata includes `goal_idx` and worker `goal_seed`.
+- `/root/slime-webshop/valid.jsonl` — validation batch of 128 prompt groups.
+- `/root/slime-webshop/summary.json`.
 
-Each row keeps the actual instruction inside the WebShop service and stores only `metadata.goal_idx` in slime.
+The generated schedule samples validation goals from `[0, 500)`, training goals from `[500, goal_count)`, and each prompt group is repeated by `N_SAMPLES_PER_PROMPT=8` during rollout.
 
 ## 3. Launch GRPO
-
-Configure paths and run:
 
 ```bash
 MODEL_ROOT=/root/Qwen2.5-3B-Instruct \
@@ -64,25 +67,15 @@ WEBSHOP_SERVICE_URL=http://127.0.0.1:3001 \
 bash examples/webshop/run_qwen2.5_3B_instruct_grpo.sh
 ```
 
-The launcher uses:
+Important launcher defaults:
 
-- `--custom-generate-function-path generate_with_webshop.generate`
-- `--dynamic-sampling-filter-path generate_with_webshop.check_episode_reward_nonzero_std`
-- `--custom-reward-post-process-path generate_with_webshop.grpo_normalize_webshop_steps`
-- `--custom-rollout-log-function-path generate_with_webshop.log_webshop_rollout`
-- `--custom-eval-rollout-log-function-path generate_with_webshop.log_webshop_eval_rollout`
-
-## Runtime knobs
-
-| Variable | Default | Meaning |
-| --- | ---: | --- |
-| `WEBSHOP_MAX_STEPS` | `30` | Max environment actions per episode. |
-| `WEBSHOP_HISTORY_LENGTH` | `4` | Recent observation/action pairs in the prompt. |
-| `WEBSHOP_STEP_MAX_TOKENS` | `256` | Per-action generation cap. |
-| `WEBSHOP_MAX_PROMPT_CHARS` | `12000` | Prompt char cap before history is dropped. |
-| `WEBSHOP_INVALID_ACTION_PENALTY` | `0.0` | Penalty subtracted per invalid model action. |
-| `WEBSHOP_OBSERVATION_MODE` | `text` | Service observation mode. |
-| `WEBSHOP_HTTP_RETRIES` | `10` | HTTP retries for service calls. |
-| `WEBSHOP_CLOSE_SESSION_ON_DONE` | `1` | Close service sessions after each rollout. |
-
-The rollout emits one trainable `Sample` per model action and broadcasts the final WebShop episode reward to all steps in the same trajectory. The custom reward post-process normalizes one reward per trajectory inside each prompt group, then broadcasts the normalized value back to every step so longer episodes are not over-weighted just because they contain more actions.
+- `ROLLOUT_BATCH_SIZE=16`
+- `N_SAMPLES_PER_PROMPT=8`
+- `GLOBAL_BATCH_SIZE=128`
+- `NUM_ROLLOUT=150`
+- `EVAL_INTERVAL=5`, with eval before train enabled by slime default
+- rollout internals follow SDAR WebShop defaults: `max_steps=15`, `history_length=2`, per-step generation cap `512`, history fallback threshold `13000` chars, invalid-action penalty `0.1` on the invalid step
+- `MAX_TOKENS_PER_GPU=32768`
+- `LOG_PROBS_CHUNK_SIZE=8192`
+- eval samples per prompt `1`, temperature `0.4`, top-p `1.0`
+- single eval dataset: `valid.jsonl`

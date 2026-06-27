@@ -8,7 +8,6 @@ WebShop's heavier dependencies live in the service environment.
 from __future__ import annotations
 
 import logging
-import os
 import uuid
 from collections import defaultdict
 from collections.abc import Iterable
@@ -20,7 +19,6 @@ from prompts import (
     WEBSHOP_SYSTEM_PROMPT,
     build_observation_prompt,
     parse_action,
-    safe_action_for_service,
 )
 
 from slime.rollout.filter_hub.base_types import DynamicFilterOutput
@@ -30,39 +28,16 @@ from slime.utils.types import Sample
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MAX_STEPS = 30
-DEFAULT_HISTORY_LENGTH = 4
-DEFAULT_STEP_MAX_TOKENS = 256
-DEFAULT_MAX_PROMPT_CHARS = 12000
-DEFAULT_INVALID_ACTION_PENALTY = 0.0
+DEFAULT_MAX_STEPS = 15
+DEFAULT_HISTORY_LENGTH = 2
+DEFAULT_STEP_MAX_TOKENS = 512
+DEFAULT_MAX_PROMPT_CHARS = 13000
+DEFAULT_INVALID_ACTION_PENALTY = 0.1
 
 
 def _get_metadata(sample: Sample) -> dict[str, Any]:
     metadata = sample.metadata or {}
     return metadata if isinstance(metadata, dict) else {}
-
-
-def _get_int_env(name: str, default: int) -> int:
-    try:
-        return int(os.environ.get(name, default))
-    except ValueError:
-        logger.warning("Invalid integer for %s=%r; using %s", name, os.environ.get(name), default)
-        return default
-
-
-def _get_float_env(name: str, default: float) -> float:
-    try:
-        return float(os.environ.get(name, default))
-    except ValueError:
-        logger.warning("Invalid float for %s=%r; using %s", name, os.environ.get(name), default)
-        return default
-
-
-def _get_bool_env(name: str, default: bool) -> bool:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _apply_chat_template(tokenizer, messages: list[dict[str, str]], *, add_generation_prompt: bool, args: Namespace) -> str:
@@ -110,13 +85,38 @@ def _response_tokens_and_logprobs(tokenizer, response: str, meta_info: dict[str,
     return tokenizer.encode(response, add_special_tokens=False), None
 
 
-def _goal_idx_from_sample(sample: Sample, metadata: dict[str, Any]) -> int | None:
-    for key in ("webshop_goal_idx", "goal_idx", "goal_id"):
-        if key in metadata and metadata[key] is not None:
-            return int(metadata[key])
-    if _get_bool_env("WEBSHOP_USE_SAMPLE_INDEX_AS_GOAL", False) and sample.index is not None:
-        return int(sample.index)
-    return None
+def _project_action_like_sdar(response: str) -> tuple[str, bool, str | None]:
+    """Mirror SDAR WebShop projection for action text and invalid-action penalty.
+
+    SDAR lowercases the model response, extracts the text between
+    ``<action>`` and ``</action>`` when present, and marks the step invalid only
+    for missing action tags, missing lowercase think tags, or Chinese text. It
+    does not check whether the projected action is admissible; the WebShop env
+    handles non-admissible actions as no-ops.
+    """
+
+    original_response = response
+    lowered = response.lower()
+    start_tag = "<action>"
+    end_tag = "</action>"
+    start_idx = lowered.find(start_tag)
+    end_idx = lowered.find(end_tag)
+    if start_idx == -1 or end_idx == -1:
+        action = lowered[-20:].strip() or "invalid"
+        return action, False, "missing_action_tag"
+
+    action = lowered[start_idx + len(start_tag) : end_idx].strip() or "invalid"
+    if original_response.find("<think>") == -1 or original_response.find("</think>") == -1:
+        return action, False, "missing_think_tag"
+    if any("\u4e00" <= char <= "\u9fff" for char in original_response):
+        return action, False, "contains_chinese"
+    return action, True, None
+
+
+def _goal_idx_from_sample(metadata: dict[str, Any]) -> int | None:
+    if metadata.get("goal_idx") is None:
+        return None
+    return int(metadata["goal_idx"])
 
 
 def _trajectory_id(sample: Sample) -> int:
@@ -125,6 +125,20 @@ def _trajectory_id(sample: Sample) -> int:
     if sample.group_index is not None:
         return int(sample.group_index)
     return 0
+
+
+def _goal_seed_from_sample(metadata: dict[str, Any]) -> int | None:
+    if metadata.get("goal_seed") is None:
+        return None
+    return int(metadata["goal_seed"])
+
+
+def _episode_reward_from_raw(*, raw_reward: float, done: bool) -> float:
+    return 10.0 if done and raw_reward >= 1.0 else 0.0
+
+
+def _step_reward(*, episode_reward: float, valid_action: bool, invalid_action_penalty: float) -> float:
+    return episode_reward - (0.0 if valid_action else invalid_action_penalty)
 
 
 def _router_headers(args: Namespace, sample: Sample) -> dict[str, str] | None:
@@ -170,6 +184,7 @@ def _episode_metadata(
         "instruction_text": instruction_text,
         "trajectory": trajectory,
         "raw_reward": raw_reward,
+        "episode_reward": _episode_reward_from_raw(raw_reward=raw_reward, done=done),
         "final_reward": final_reward,
         "done": done,
         "invalid_action_count": invalid_action_count,
@@ -196,19 +211,18 @@ async def generate(
     if sample.session_id is None:
         sample.session_id = str(uuid.uuid4())
 
-    max_steps = _get_int_env("WEBSHOP_MAX_STEPS", DEFAULT_MAX_STEPS)
-    history_length = _get_int_env("WEBSHOP_HISTORY_LENGTH", DEFAULT_HISTORY_LENGTH)
-    step_max_tokens = _get_int_env("WEBSHOP_STEP_MAX_TOKENS", DEFAULT_STEP_MAX_TOKENS)
-    max_prompt_chars = _get_int_env("WEBSHOP_MAX_PROMPT_CHARS", DEFAULT_MAX_PROMPT_CHARS)
-    invalid_action_penalty = _get_float_env("WEBSHOP_INVALID_ACTION_PENALTY", DEFAULT_INVALID_ACTION_PENALTY)
-    close_on_done = _get_bool_env("WEBSHOP_CLOSE_SESSION_ON_DONE", True)
-    observation_mode = os.environ.get("WEBSHOP_OBSERVATION_MODE")
+    max_steps = DEFAULT_MAX_STEPS
+    history_length = DEFAULT_HISTORY_LENGTH
+    step_max_tokens = DEFAULT_STEP_MAX_TOKENS
+    max_prompt_chars = DEFAULT_MAX_PROMPT_CHARS
+    invalid_action_penalty = DEFAULT_INVALID_ACTION_PENALTY
 
-    goal_idx = _goal_idx_from_sample(sample, metadata)
+    goal_idx = _goal_idx_from_sample(metadata)
+    goal_seed = _goal_seed_from_sample(metadata)
     reset_state = await reset_session(
         session_id=sample.session_id,
         goal_idx=goal_idx,
-        observation_mode=observation_mode,
+        goal_seed=goal_seed,
     )
     instruction_text = reset_state["instruction_text"]
     current_observation = reset_state["observation"]
@@ -268,8 +282,8 @@ async def generate(
             assistant_response_tokens.extend(response_tokens)
 
             parsed = parse_action(response, available_actions)
-            service_action = safe_action_for_service(parsed, available_actions, instruction_text)
-            if not parsed.is_valid:
+            service_action, valid_for_penalty, projection_invalid_reason = _project_action_like_sdar(response)
+            if not valid_for_penalty:
                 invalid_action_count += 1
 
             final_state = await step_session(session_id=sample.session_id, action=service_action)
@@ -282,8 +296,9 @@ async def generate(
                 "model_response": response,
                 "parsed_action": parsed.action,
                 "service_action": service_action,
-                "valid_action": parsed.is_valid,
-                "invalid_reason": parsed.invalid_reason,
+                "valid_action": valid_for_penalty,
+                "admissible_action": parsed.valid_admissible,
+                "invalid_reason": projection_invalid_reason or parsed.invalid_reason,
                 "reward": raw_reward,
                 "done": done,
                 "prompt_tokens": len(prompt_tokens),
@@ -321,10 +336,10 @@ async def generate(
             current_observation = final_state["observation"]
             available_actions = final_state.get("available_actions", {})
     finally:
-        if close_on_done:
-            await close_session(sample.session_id)
+        await close_session(sample.session_id)
 
-    final_reward = max(0.0, raw_reward - invalid_action_penalty * invalid_action_count)
+    episode_reward = _episode_reward_from_raw(raw_reward=raw_reward, done=done)
+    final_reward = episode_reward - invalid_action_penalty * invalid_action_count
     episode_metadata = _episode_metadata(
         metadata=metadata,
         session_id=sample.session_id,
@@ -356,12 +371,21 @@ async def generate(
             step_sample.rollout_log_probs = None
 
     for step_sample in step_samples:
-        step_sample.reward = final_reward
+        step_record = step_sample.metadata["webshop_step"]
+        valid_action = bool(step_record.get("valid_action"))
+        step_penalty = 0.0 if valid_action else invalid_action_penalty
+        step_sample.reward = _step_reward(
+            episode_reward=episode_reward,
+            valid_action=valid_action,
+            invalid_action_penalty=invalid_action_penalty,
+        )
         step_sample.metadata = {
             **episode_metadata,
             "episode_id": trajectory_id,
             "turn_step": step_sample.metadata["turn_step"],
-            "webshop_step": step_sample.metadata["webshop_step"],
+            "webshop_step": step_record,
+            "step_reward": step_sample.reward,
+            "step_invalid_action_penalty": step_penalty,
         }
 
     return step_samples
@@ -392,7 +416,8 @@ def check_episode_reward_nonzero_std(args, samples: list[Sample] | list[list[Sam
     for trajectory_samples in _trajectory_units(samples):
         if not trajectory_samples:
             continue
-        rewards.append(trajectory_samples[0].get_reward_value(args))
+        metadata = trajectory_samples[0].metadata if isinstance(trajectory_samples[0].metadata, dict) else {}
+        rewards.append(float(metadata.get("episode_reward", trajectory_samples[0].get_reward_value(args))))
 
     if len(rewards) <= 1:
         return DynamicFilterOutput(keep=True)
@@ -427,12 +452,15 @@ def grpo_normalize_webshop_steps(args, samples: list[Sample]) -> tuple[list[floa
     import torch
 
     prompt_groups: dict[int, dict[int, float]] = defaultdict(dict)
-    sample_keys: list[tuple[int, int]] = []
+    sample_keys: list[tuple[int, int, float]] = []
     for sample, reward in zip(samples, raw_rewards, strict=True):
         prompt_key = sample.group_index if sample.group_index is not None else sample.index
         traj_key = sample.group_id if sample.group_id is not None else sample.index
-        prompt_groups[prompt_key][traj_key] = float(reward)
-        sample_keys.append((prompt_key, traj_key))
+        metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+        step_penalty = float(metadata.get("step_invalid_action_penalty", 0.0))
+        episode_reward = float(metadata.get("episode_reward", float(reward) + step_penalty))
+        prompt_groups[prompt_key][traj_key] = episode_reward
+        sample_keys.append((prompt_key, traj_key, step_penalty))
 
     normalized_by_traj: dict[tuple[int, int], float] = {}
     use_std = getattr(args, "advantage_estimator", None) in ["grpo", "gspo"] and getattr(
@@ -447,7 +475,7 @@ def grpo_normalize_webshop_steps(args, samples: list[Sample]) -> tuple[list[floa
         for traj_id, value in zip(traj_ids, normalized.tolist(), strict=True):
             normalized_by_traj[(prompt_key, traj_id)] = float(value)
 
-    processed = [normalized_by_traj[key] for key in sample_keys]
+    processed = [normalized_by_traj[(prompt_key, traj_key)] - step_penalty for prompt_key, traj_key, step_penalty in sample_keys]
     return raw_rewards, processed
 
 
