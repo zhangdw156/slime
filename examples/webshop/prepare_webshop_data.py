@@ -9,7 +9,7 @@ This script writes the fixed slime WebShop goal schedule used by the
 examples in this directory:
 
 * ``train.jsonl``: training goal indices are sampled from ``[500, goal_count)``;
-* ``valid.jsonl``: validation goal indices are sampled from ``[0, 500)``;
+* ``valid.jsonl``: validation goal indices are the prefix of ``[0, 500)``;
 * each row carries the WebShop goal seed needed to reproduce per-worker
   synthetic-goal ordering.
 """
@@ -71,8 +71,8 @@ def _build_slime_webshop_rows(
     """Build the static slime WebShop rollout schedule.
 
     The default schedule uses ``env_seed=0``, train batch size ``16``,
-    validation size ``128``, training goals from ``range(500, goal_count)``,
-    and validation goals from ``range(500)``.
+    validation size ``100``, training goals from ``range(500, goal_count)``,
+    and validation goals from ``range(100)``.
     Worker j uses goal order seed ``env_seed + j`` for train and
     ``env_seed + 1000 + j`` for validation.
     """
@@ -107,9 +107,7 @@ def _build_slime_webshop_rows(
                 )
             )
 
-    valid_pool = np.arange(0, train_start)
-    valid_rng = np.random.RandomState(args.env_seed + 1000)
-    valid_indices = valid_rng.choice(valid_pool, size=args.valid_size, replace=False)
+    valid_indices = np.arange(0, args.valid_size)
     valid_rows = [
         _record(
             goal_idx,
@@ -150,7 +148,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-start", type=int, default=500, help="First train goal index; lower indices are validation goals.")
     parser.add_argument("--train-batch-size", type=int, default=16, help="Number of train goal indices per rollout batch.")
     parser.add_argument("--total-rollouts", type=int, default=150, help="Number of train rollout batches to materialize.")
-    parser.add_argument("--valid-size", type=int, default=128, help="Number of validation goals to materialize.")
+    parser.add_argument("--valid-size", type=int, default=100, help="Number of validation goals to materialize.")
     return parser.parse_args()
 
 

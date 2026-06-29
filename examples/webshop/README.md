@@ -1,6 +1,6 @@
 # WebShop GRPO example
 
-This example trains `Qwen2.5-3B-Instruct` with slime GRPO against a separately deployed WebShop HTTP service. The defaults target the WebShop small synthetic setup: `env_seed=0`, `max_steps=15`, train pool `goal_idx >= 500`, validation pool `goal_idx < 500`, `train_batch_size=16`, `rollout.n=8`, `val_batch_size=128`, `test_freq=5`, and `total_epochs=150`.
+This example trains `Qwen2.5-3B-Instruct` with slime GRPO against a separately deployed WebShop HTTP service. The defaults target the WebShop small synthetic setup: `env_seed=0`, `max_steps=15`, train pool `goal_idx >= 500`, train-time validation `goal_idx < 100`, full held-out validation `goal_idx < 500`, `train_batch_size=16`, `rollout.n=8`, `val_batch_size=100`, `test_freq=5`, and `total_epochs=150`.
 
 ## Files
 
@@ -11,6 +11,7 @@ This example trains `Qwen2.5-3B-Instruct` with slime GRPO against a separately d
 | `generate_with_webshop.py` | Custom slime generation function, GRPO reward normalization, rollout/eval metrics. |
 | `prepare_webshop_data.py` | Builds lightweight WebShop goal metadata JSONL files: `train.jsonl` and `valid.jsonl`. |
 | `run_qwen2.5_3B_instruct_grpo.sh` | Qwen2.5-3B-Instruct GRPO launcher with WebShop small synthetic defaults. |
+| `eval_qwen2.5_3B_instruct_full_valid.sh` | Eval-only launcher for the full 500-goal held-out validation pool. |
 
 ## 1. Start the WebShop service
 
@@ -51,10 +52,10 @@ python examples/webshop/prepare_webshop_data.py \
 This writes the fixed slime WebShop task schedule:
 
 - `/root/slime-webshop/train.jsonl` — 150 rollout batches × 16 prompt groups; metadata includes `goal_idx` and worker `goal_seed`.
-- `/root/slime-webshop/valid.jsonl` — validation batch of 128 prompt groups.
+- `/root/slime-webshop/valid.jsonl` — train-time validation batch of 100 prompt groups, `goal_idx` 0 through 99.
 - `/root/slime-webshop/summary.json`.
 
-The generated schedule samples validation goals from `[0, 500)`, training goals from `[500, goal_count)`, and each prompt group is repeated by `N_SAMPLES_PER_PROMPT=8` during rollout.
+The generated schedule keeps validation goals from `[0, 100)`, training goals from `[500, goal_count)`, and each prompt group is repeated by `N_SAMPLES_PER_PROMPT=8` during rollout. Goals `[100, 500)` are held out from training-time eval and are included only in the full validation launcher below.
 
 ## 3. Launch GRPO
 
@@ -79,3 +80,19 @@ Important launcher defaults:
 - `LOG_PROBS_CHUNK_SIZE=8192`
 - eval samples per prompt `1`, temperature `0.4`, top-p `1.0`
 - single eval dataset: `valid.jsonl`
+
+## 4. Run full held-out validation only
+
+Use the full-valid eval launcher after training when you want to score a saved checkpoint on all 500 held-out WebShop goals. The launcher writes a separate full-eval task directory and does not overwrite the training-time files under `/root/slime-webshop`.
+
+```bash
+MODEL_ROOT=/root/Qwen2.5-3B-Instruct \
+SLIME_CKPT=/root/Qwen2.5-3B-Instruct_webshop_grpo_slime \
+WEBSHOP_FULL_EVAL_TASK_DIR=/root/slime-webshop-full-eval \
+WEBSHOP_SERVICE_URL=http://127.0.0.1:3001 \
+bash examples/webshop/eval_qwen2.5_3B_instruct_full_valid.sh
+```
+
+By default the script loads the latest checkpoint recorded by `latest_checkpointed_iteration.txt`. To evaluate a specific saved checkpoint, set `CKPT_STEP`; for example, `CKPT_STEP=50` loads `iter_0000050` from `SLIME_CKPT`.
+
+The script runs slime in eval-only mode with `--num-rollout 0` and `--eval-interval 1`, generates `valid_full.jsonl` with `goal_idx` 0 through 499, logs metrics under `eval/valid_full/...`, and exits without training.
