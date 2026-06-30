@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Build step-level SFT data from raw reward-1 ALFWorld teacher trajectories.
+"""Build step-level SFT data from collected ALFWorld teacher trajectories.
 
-The collector keeps every trajectory whose environment reward is 1. This script
-then performs the SFT-specific cleanup:
+The collector stores every sampled trajectory attempt. This script performs the
+SFT-specific successful-trajectory selection and cleanup:
 
 1. group trajectories by original ``sample_id``;
 2. keep only the shortest successful trajectory for each sample;
@@ -46,7 +46,7 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
-def _is_reward1(trajectory: dict[str, Any]) -> bool:
+def _is_successful(trajectory: dict[str, Any]) -> bool:
     return float(trajectory.get("reward", 0.0)) == 1.0 or trajectory.get("won") is True
 
 
@@ -70,7 +70,7 @@ def _trajectory_sort_key(trajectory: dict[str, Any]) -> tuple[int, int, int, str
 def _select_shortest_per_sample(trajectories: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for trajectory in trajectories:
-        if _is_reward1(trajectory) and not trajectory.get("error") and trajectory.get("steps"):
+        if _is_successful(trajectory) and not trajectory.get("error") and trajectory.get("steps"):
             grouped[_sample_key(trajectory)].append(trajectory)
 
     selected = [sorted(group, key=_trajectory_sort_key)[0] for group in grouped.values()]
@@ -182,9 +182,9 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         "input": args.input,
         "output": str(output_path),
         "input_trajectories": len(trajectories),
-        "reward1_trajectories": sum(1 for item in trajectories if _is_reward1(item)),
+        "successful_trajectories": sum(1 for item in trajectories if _is_successful(item)),
         "selected_trajectories": len(selected),
-        "samples_with_multiple_reward1": groups_with_multiple,
+        "samples_with_multiple_successes": groups_with_multiple,
         "sft_samples": len(rows),
         "task_type_samples": dict(sorted(task_type_counts.items())),
         "skipped_steps": dict(sorted(skipped_steps.items())),
@@ -194,16 +194,15 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         summary_path.parent.mkdir(parents=True, exist_ok=True)
         summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print(
-        f"done: selected={summary['selected_trajectories']} sft_samples={summary['sft_samples']} "
-        f"output={output_path}",
+        f"done: selected={summary['selected_trajectories']} sft_samples={summary['sft_samples']} output={output_path}",
         flush=True,
     )
     return summary
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build SFT rows from reward-1 ALFWorld teacher trajectories.")
-    parser.add_argument("--input", required=True, help="reward1_trajectories.jsonl from the collector.")
+    parser = argparse.ArgumentParser(description="Build SFT rows from collected ALFWorld teacher trajectories.")
+    parser.add_argument("--input", required=True, help="all_trajectories.jsonl from the collector.")
     parser.add_argument("--output", required=True, help="Output .jsonl or .parquet SFT dataset.")
     parser.add_argument("--summary-output", default=None)
     parser.add_argument("--source", default="qwen2.5-3b-alfworld-teacher")

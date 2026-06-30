@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Collect reward-1 ALFWorld teacher trajectories for offline SFT distillation.
+"""Collect ALFWorld teacher trajectories for analysis and offline SFT distillation.
 
 This collector mirrors the batched ALFWorld rollout structure used during
 training: sample rows are expanded into repeated sampling tasks, each active
@@ -7,10 +7,10 @@ task owns one Ray-managed ALFWorld environment, and every batch advances those
 environments step-by-step while sending concurrent requests to an already
 running SGLang teacher.
 
-The collector intentionally writes only raw trajectories whose environment
-reward is 1 (i.e. ``won=True``), without subtracting invalid-action penalties.
-Filtering/selection for SFT is handled by
-``build_sft_from_teacher_trajectories.py``.
+The collector writes every completed sampling attempt to one append-only JSONL
+ledger, regardless of whether the teacher wins, fails, truncates, aborts, or
+hits an error. Filtering/selection for SFT is handled by
+``build_sft_from_teacher_trajectories.py`` rather than by the collector.
 """
 
 from __future__ import annotations
@@ -43,6 +43,7 @@ except Exception:  # pragma: no cover
 logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_STEPS = 50
+DEFAULT_SAMPLES_PER_TASK = 8
 DEFAULT_HISTORY_LENGTH = 4
 DEFAULT_STEP_MAX_TOKENS = 512
 DEFAULT_REQUEST_TIMEOUT = 0.0
@@ -125,6 +126,7 @@ class TrajectoryState:
     aborted: bool = False
     closed: bool = False
     progress_counted: bool = False
+    row_written: bool = False
 
 
 class _FallbackProgress:
@@ -207,22 +209,57 @@ def _load_existing_trajectory_ids(path: Path) -> set[str]:
 def _prepare_outputs(args: argparse.Namespace) -> tuple[Path, Path, set[str]]:
     output_dir = Path(args.output_dir).expanduser()
     output_dir.mkdir(parents=True, exist_ok=True)
-    reward_output = Path(args.reward_output).expanduser() if args.reward_output else output_dir / "reward1_trajectories.jsonl"
+    trajectory_output = Path(args.trajectory_output).expanduser() if args.trajectory_output else output_dir / "all_trajectories.jsonl"
     summary_output = Path(args.summary_output).expanduser() if args.summary_output else output_dir / "collect_summary.json"
-    reward_output.parent.mkdir(parents=True, exist_ok=True)
+    trajectory_output.parent.mkdir(parents=True, exist_ok=True)
     summary_output.parent.mkdir(parents=True, exist_ok=True)
 
     if args.overwrite:
-        reward_output.write_text("", encoding="utf-8")
+        trajectory_output.write_text("", encoding="utf-8")
         if summary_output.exists():
             summary_output.unlink()
-        return reward_output, summary_output, set()
+        return trajectory_output, summary_output, set()
 
-    if reward_output.exists() and reward_output.stat().st_size > 0 and not args.resume:
-        raise FileExistsError(f"Output already exists: {reward_output}. Use --resume or --overwrite.")
+    if trajectory_output.exists() and trajectory_output.stat().st_size > 0 and not args.resume:
+        raise FileExistsError(f"Output already exists: {trajectory_output}. Use --resume or --overwrite.")
 
-    seen_ids = _load_existing_trajectory_ids(reward_output) if args.resume else set()
-    return reward_output, summary_output, seen_ids
+    seen_ids = _load_existing_trajectory_ids(trajectory_output) if args.resume else set()
+    return trajectory_output, summary_output, seen_ids
+
+
+class JsonlTrajectoryWriter:
+    """Write trajectory rows immediately to one all-attempt JSONL file."""
+
+    def __init__(self, trajectory_output: Path, *, mode: str, fsync_every: int = 0) -> None:
+        self.trajectory_output = trajectory_output
+        self.fsync_every = fsync_every
+        self._trajectory_writer = trajectory_output.open(mode, encoding="utf-8")
+        self._write_count = 0
+        self._closed = False
+
+    def __enter__(self) -> JsonlTrajectoryWriter:
+        return self
+
+    def __exit__(self, *_exc_info: Any) -> None:
+        self.close()
+
+    def write(self, row: dict[str, Any]) -> None:
+        line = _json_dumps(row) + "\n"
+        self._trajectory_writer.write(line)
+        self._trajectory_writer.flush()
+
+        self._write_count += 1
+        if self.fsync_every and self._write_count % self.fsync_every == 0:
+            os.fsync(self._trajectory_writer.fileno())
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._trajectory_writer.flush()
+        if self.fsync_every:
+            os.fsync(self._trajectory_writer.fileno())
+        self._trajectory_writer.close()
+        self._closed = True
 
 
 def _safe_action_for_env(parsed_action: str, admissible_actions: list[str]) -> str:
@@ -474,6 +511,7 @@ def _make_initial_trajectory(args: argparse.Namespace, task: SamplingTask, seed:
     sample = task.sample
     metadata = sample.metadata
     return {
+        "schema_version": 2,
         "trajectory_id": _trajectory_id(task),
         "sample_id": sample.sample_id,
         "sample_row_id": sample.row_id,
@@ -501,6 +539,8 @@ def _make_initial_trajectory(args: argparse.Namespace, task: SamplingTask, seed:
         "won": False,
         "truncated": False,
         "aborted": False,
+        "status": "running",
+        "terminal_reason": None,
         "invalid_action_count": 0,
         "reward": 0.0,
         "penalized_reward": 0.0,
@@ -508,17 +548,50 @@ def _make_initial_trajectory(args: argparse.Namespace, task: SamplingTask, seed:
     }
 
 
+def _trajectory_status(row: dict[str, Any]) -> str:
+    if row.get("error"):
+        return "error"
+    if row.get("aborted"):
+        return "aborted"
+    if row.get("reward", 0.0) == 1.0 or row.get("won") is True:
+        return "success"
+    if row.get("done"):
+        return "failed"
+    if row.get("truncated"):
+        return "truncated"
+    return "unknown"
+
+
+def _terminal_reason(row: dict[str, Any]) -> str:
+    status = str(row.get("status") or _trajectory_status(row))
+    if status == "error":
+        return "exception"
+    if status == "aborted":
+        return "sglang_abort"
+    if status == "success":
+        return "env_won"
+    if status == "failed":
+        return "env_done_without_reward"
+    if status == "truncated":
+        return "max_steps"
+    return "unknown"
+
+
 def _mark_finished(progress: Any, counters: Counter[str], trajectory: TrajectoryState) -> None:
     if trajectory.progress_counted:
         return
     trajectory.progress_counted = True
+    status = str(trajectory.trajectory.get("status") or _trajectory_status(trajectory.trajectory))
     counters["completed"] += 1
-    if trajectory.trajectory.get("error"):
+    counters[f"status:{status}"] += 1
+    if status == "failed":
         counters["failed"] += 1
-    if trajectory.trajectory.get("reward", 0.0) == 1.0:
-        counters["reward1"] += 1
+    if status == "error":
+        counters["errors"] += 1
+    if status == "success":
+        counters["success"] += 1
     progress.update(1)
-    progress.set_postfix(reward1=counters["reward1"], failed=counters["failed"], refresh=False)
+    progress.set_postfix(success=counters["success"], failed=counters["failed"], errors=counters["errors"], refresh=False)
 
 
 async def _close_finished_envs(pool: RayEnvWorkerPool, trajectories: list[TrajectoryState]) -> None:
@@ -596,7 +669,25 @@ def _finalize_trajectory(trajectory: TrajectoryState, elapsed_sec: float) -> dic
     row["last_info"] = trajectory.last_info
     row["penalized_reward"] = float(row.get("reward", 0.0)) - 0.01 * int(row.get("invalid_action_count", 0))
     row["elapsed_sec"] = elapsed_sec
+    row["status"] = _trajectory_status(row)
+    row["terminal_reason"] = _terminal_reason(row)
     return row
+
+
+def _finish_and_write_trajectory(
+    *,
+    trajectory: TrajectoryState,
+    elapsed_sec: float,
+    writer: JsonlTrajectoryWriter,
+    progress: Any,
+    counters: Counter[str],
+) -> None:
+    if trajectory.row_written:
+        return
+    row = _finalize_trajectory(trajectory, elapsed_sec)
+    writer.write(row)
+    trajectory.row_written = True
+    _mark_finished(progress, counters, trajectory)
 
 
 async def _run_task_batch(
@@ -608,7 +699,8 @@ async def _run_task_batch(
     tasks: list[SamplingTask],
     progress: Any,
     counters: Counter[str],
-) -> list[dict[str, Any]]:
+    writer: JsonlTrajectoryWriter,
+) -> None:
     batch_start = time.perf_counter()
     workers = pool.acquire(len(tasks))
     trajectories: list[TrajectoryState] = []
@@ -633,7 +725,13 @@ async def _run_task_batch(
             if isinstance(reset_result, Exception):
                 state.trajectory["error"] = repr(reset_result)
                 state.aborted = True
-                _mark_finished(progress, counters, state)
+                _finish_and_write_trajectory(
+                    trajectory=state,
+                    elapsed_sec=time.perf_counter() - batch_start,
+                    writer=writer,
+                    progress=progress,
+                    counters=counters,
+                )
                 continue
             state.task_description = _task_description_from_reset(reset_result.observation)
             state.current_observation = reset_result.observation
@@ -645,7 +743,7 @@ async def _run_task_batch(
         await _close_finished_envs(pool, trajectories)
 
         for step_id in range(args.max_steps):
-            active = [state for state in trajectories if not state.done and not state.aborted and not state.trajectory.get("error")]
+            active = [state for state in trajectories if not state.row_written and not state.done and not state.aborted and not state.trajectory.get("error")]
             if not active:
                 break
 
@@ -669,7 +767,13 @@ async def _run_task_batch(
                 if isinstance(gen_result, Exception):
                     state.trajectory["error"] = repr(gen_result)
                     state.aborted = True
-                    _mark_finished(progress, counters, state)
+                    _finish_and_write_trajectory(
+                        trajectory=state,
+                        elapsed_sec=time.perf_counter() - batch_start,
+                        writer=writer,
+                        progress=progress,
+                        counters=counters,
+                    )
                     continue
 
                 output = gen_result["output"]
@@ -678,7 +782,13 @@ async def _run_task_batch(
                 if finish_reason.get("type") == "abort":
                     state.aborted = True
                     state.trajectory["aborted"] = True
-                    _mark_finished(progress, counters, state)
+                    _finish_and_write_trajectory(
+                        trajectory=state,
+                        elapsed_sec=time.perf_counter() - batch_start,
+                        writer=writer,
+                        progress=progress,
+                        counters=counters,
+                    )
                     continue
 
                 response = output.get("text", "") or ""
@@ -698,36 +808,54 @@ async def _run_task_batch(
                 if isinstance(step_result, Exception):
                     state.trajectory["error"] = repr(step_result)
                     state.aborted = True
-                    _mark_finished(progress, counters, state)
+                    _finish_and_write_trajectory(
+                        trajectory=state,
+                        elapsed_sec=time.perf_counter() - batch_start,
+                        writer=writer,
+                        progress=progress,
+                        counters=counters,
+                    )
                     continue
                 _apply_step_result(tokenizer, item, step_result)
                 if state.done:
-                    _mark_finished(progress, counters, state)
+                    _finish_and_write_trajectory(
+                        trajectory=state,
+                        elapsed_sec=time.perf_counter() - batch_start,
+                        writer=writer,
+                        progress=progress,
+                        counters=counters,
+                    )
 
             await _close_finished_envs(pool, trajectories)
 
         elapsed_sec = time.perf_counter() - batch_start
-        rows = []
         for state in trajectories:
-            row = _finalize_trajectory(state, elapsed_sec)
-            if not state.progress_counted:
-                _mark_finished(progress, counters, state)
-            rows.append(row)
-        return rows
+            _finish_and_write_trajectory(
+                trajectory=state,
+                elapsed_sec=elapsed_sec,
+                writer=writer,
+                progress=progress,
+                counters=counters,
+            )
     finally:
         await pool.release(workers)
 
 
 def _summarize(counters: Counter[str], elapsed_sec: float, args: argparse.Namespace, *, worker_count: int) -> dict[str, Any]:
     completed = counters["completed"]
+    status_counts = {key.removeprefix("status:"): value for key, value in sorted(counters.items()) if key.startswith("status:")}
     return {
         "elapsed_sec": elapsed_sec,
+        "input_samples": counters["input_samples"],
+        "requested_tasks": counters["requested_tasks"],
         "total_tasks": counters["total_tasks"],
         "completed": completed,
-        "reward1": counters["reward1"],
+        "success": counters["success"],
         "failed": counters["failed"],
+        "errors": counters["errors"],
+        "status_counts": status_counts,
         "skipped_existing": counters["skipped_existing"],
-        "reward1_rate": counters["reward1"] / completed if completed else 0.0,
+        "success_rate": counters["success"] / completed if completed else 0.0,
         "samples_per_task": args.samples_per_task,
         "max_concurrent_tasks": args.max_concurrent_tasks,
         "ray_workers_created": worker_count,
@@ -735,7 +863,7 @@ def _summarize(counters: Counter[str], elapsed_sec: float, args: argparse.Namesp
             "teacher_url": args.teacher_url,
             "task_file": args.task_file,
             "output_dir": args.output_dir,
-            "reward_output": args.reward_output,
+            "trajectory_output": args.trajectory_output,
             "tokenizer_path": args.tokenizer_path,
             "max_steps": args.max_steps,
             "history_length": args.history_length,
@@ -743,6 +871,7 @@ def _summarize(counters: Counter[str], elapsed_sec: float, args: argparse.Namesp
             "temperature": args.temperature,
             "top_p": args.top_p,
             "top_k": args.top_k,
+            "fsync_every": args.fsync_every,
         },
     }
 
@@ -754,7 +883,8 @@ async def _collect(args: argparse.Namespace) -> None:
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path, trust_remote_code=True)
     samples = _load_samples(Path(args.task_file).expanduser(), start_index=args.start_index, limit=args.limit)
     tasks = _expand_sampling_tasks(samples, args.samples_per_task)
-    reward_output, summary_output, seen_ids = _prepare_outputs(args)
+    requested_tasks = len(tasks)
+    trajectory_output, summary_output, seen_ids = _prepare_outputs(args)
     if seen_ids:
         before = len(tasks)
         tasks = [task for task in tasks if _trajectory_id(task) not in seen_ids]
@@ -762,9 +892,12 @@ async def _collect(args: argparse.Namespace) -> None:
     else:
         skipped = 0
 
-    counters: Counter[str] = Counter(total_tasks=len(tasks), skipped_existing=skipped)
+    counters: Counter[str] = Counter(input_samples=len(samples), requested_tasks=requested_tasks, total_tasks=len(tasks), skipped_existing=skipped)
     if not tasks:
-        summary_output.write_text(json.dumps(_summarize(counters, 0.0, args, worker_count=0), indent=2) + "\n")
+        summary_output.write_text(
+            json.dumps(_summarize(counters, 0.0, args, worker_count=0), ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
         return
 
     ray = _ensure_ray()
@@ -784,11 +917,11 @@ async def _collect(args: argparse.Namespace) -> None:
     mode = "a" if args.resume else "w"
     progress = _make_progress(len(tasks))
     try:
-        with reward_output.open(mode, encoding="utf-8") as writer:
+        with JsonlTrajectoryWriter(trajectory_output, mode=mode, fsync_every=args.fsync_every) as writer:
             async with httpx.AsyncClient(timeout=timeout, limits=limits, trust_env=False) as client:
                 for offset in range(0, len(tasks), args.max_concurrent_tasks):
                     batch = tasks[offset : offset + args.max_concurrent_tasks]
-                    rows = await _run_task_batch(
+                    await _run_task_batch(
                         args=args,
                         tokenizer=tokenizer,
                         client=client,
@@ -796,11 +929,8 @@ async def _collect(args: argparse.Namespace) -> None:
                         tasks=batch,
                         progress=progress,
                         counters=counters,
+                        writer=writer,
                     )
-                    for row in rows:
-                        if row.get("reward", 0.0) == 1.0:
-                            writer.write(_json_dumps(row) + "\n")
-                    writer.flush()
     finally:
         progress.close()
         pool.shutdown()
@@ -809,36 +939,30 @@ async def _collect(args: argparse.Namespace) -> None:
     summary = _summarize(counters, elapsed_sec, args, worker_count=pool.created_count)
     summary_output.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print(
-        "done: "
-        f"completed={summary['completed']} reward1={summary['reward1']} "
-        f"failed={summary['failed']} elapsed={elapsed_sec:.1f}s output={reward_output}",
+        f"done: completed={summary['completed']} success={summary['success']} failed={summary['failed']} errors={summary['errors']} elapsed={elapsed_sec:.1f}s output={trajectory_output}",
         flush=True,
     )
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Collect reward-1 ALFWorld teacher trajectories with Ray env workers.")
+    parser = argparse.ArgumentParser(description="Collect all ALFWorld teacher trajectories with Ray env workers.")
 
     # Core inputs.
     parser.add_argument("--teacher-url", default=os.environ.get("TEACHER_URL", "http://127.0.0.1:30000/generate"))
     parser.add_argument("--tokenizer-path", required=True, help="Tokenizer/model dir matching the teacher chat template.")
     parser.add_argument("--task-file", required=True, help="ALFWorld train_games.jsonl generated by prepare_alfworld_data.py.")
     parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--reward-output", default=None, help="JSONL path for raw reward=1 trajectories.")
+    parser.add_argument("--trajectory-output", default=None, help="JSONL path for all trajectory attempts.")
     parser.add_argument("--summary-output", default=None)
     parser.add_argument("--config-path", default=_get_env_config_path())
     parser.add_argument("--teacher-model-name", default=os.environ.get("TEACHER_MODEL_NAME", "qwen2.5-3b-alfworld-teacher"))
 
     # ALFWorld/task and server knobs.
-    parser.add_argument("--samples-per-task", type=int, default=int(os.environ.get("SAMPLES_PER_TASK", 4)))
+    parser.add_argument("--samples-per-task", type=int, default=int(os.environ.get("SAMPLES_PER_TASK", DEFAULT_SAMPLES_PER_TASK)))
     parser.add_argument("--max-concurrent-tasks", type=int, default=int(os.environ.get("MAX_CONCURRENT_TASKS", 128)))
     parser.add_argument("--max-steps", type=int, default=int(os.environ.get("ALFWORLD_MAX_STEPS", DEFAULT_MAX_STEPS)))
-    parser.add_argument(
-        "--history-length", type=int, default=int(os.environ.get("ALFWORLD_HISTORY_LENGTH", DEFAULT_HISTORY_LENGTH))
-    )
-    parser.add_argument(
-        "--step-max-tokens", type=int, default=int(os.environ.get("ALFWORLD_STEP_MAX_TOKENS", DEFAULT_STEP_MAX_TOKENS))
-    )
+    parser.add_argument("--history-length", type=int, default=int(os.environ.get("ALFWORLD_HISTORY_LENGTH", DEFAULT_HISTORY_LENGTH)))
+    parser.add_argument("--step-max-tokens", type=int, default=int(os.environ.get("ALFWORLD_STEP_MAX_TOKENS", DEFAULT_STEP_MAX_TOKENS)))
     parser.add_argument("--temperature", type=float, default=float(os.environ.get("TEMPERATURE", 0.7)))
     parser.add_argument("--top-p", type=float, default=float(os.environ.get("TOP_P", 0.95)))
     parser.add_argument("--top-k", type=int, default=None)
@@ -849,6 +973,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--fsync-every", type=int, default=0, help="Fsync output files every N completed trajectories; 0 disables fsync.")
 
     # Runtime defaults, normally left untouched.
     parser.add_argument("--ray-address", default=os.environ.get("RAY_ADDRESS", ""))
@@ -863,6 +988,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--max-concurrent-tasks must be positive")
     if args.max_steps <= 0:
         parser.error("--max-steps must be positive")
+    if args.fsync_every < 0:
+        parser.error("--fsync-every must be non-negative")
     if args.resume and args.overwrite:
         parser.error("--resume and --overwrite are mutually exclusive")
     return args
