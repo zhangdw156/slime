@@ -138,6 +138,23 @@ are all skipped on restart. Each completed trajectory is flushed immediately;
 set `--fsync-every N` only if you need an additional durability barrier beyond
 normal flushes.
 
+
+### Inspect collected teacher trajectories
+
+After collection, you can inspect `all_trajectories.jsonl` with the bundled
+read-only web viewer:
+
+```bash
+cd examples/alfworld/trajectory_viewer
+npm run dev
+```
+
+Open the printed URL and choose the server directory that contains
+`all_trajectories.jsonl`. The viewer streams the JSONL ledger, shows aggregate
+analysis such as status counts, success@8, task-type success rates, invalid
+actions, token/step averages, grouped sample attempts, per-sample action transition graphs,
+shortest-success SFT candidates, and step-by-step trajectory details.
+
 Then train the 0.5B student on the generated messages JSONL:
 
 ```bash

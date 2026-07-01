@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ALFWorld Trajectory Detail</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <header class="hero compact">
+      <div>
+        <p class="eyebrow">examples/alfworld</p>
+        <h1>Trajectory detail</h1>
+        <p class="subtitle" id="detailSubtitle">Step-by-step prompts, responses, observations, and actions.</p>
+      </div>
+      <div class="server-badge" id="serverStatus">Checking dataset</div>
+    </header>
+
+    <main>
+      <nav class="nav-links" id="detailNav">
+        <a class="link" href="/">← Overview</a>
+      </nav>
+      <section id="message" class="message hidden"></section>
+      <section class="grid cards" id="trajectoryCards"></section>
+      <section class="panel" id="taskPanel"></section>
+      <section id="steps"></section>
+    </main>
+
+    <script type="module" src="/trajectory.js"></script>
+  </body>
+</html>

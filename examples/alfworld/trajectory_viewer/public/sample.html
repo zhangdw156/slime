@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ALFWorld Sample Detail</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <header class="hero compact">
+      <div>
+        <p class="eyebrow">examples/alfworld</p>
+        <h1>Sample detail</h1>
+        <p class="subtitle" id="sampleSubtitle">One sample's trajectory attempts.</p>
+      </div>
+      <div class="server-badge" id="serverStatus">Checking dataset</div>
+    </header>
+
+    <main>
+      <nav class="nav-links">
+        <a class="link" href="/">← Overview</a>
+      </nav>
+      <section id="message" class="message hidden"></section>
+      <section class="grid cards" id="sampleCards"></section>
+      <section id="gamefilePath" class="path-note hidden"></section>
+
+      <section class="panel">
+        <div class="section-heading">
+          <div>
+            <h2>Action transition graph</h2>
+            <p>Readable overview of all sampled trajectories. The same action is one shared node; the default view keeps only high-frequency transitions and lets you focus any node.</p>
+          </div>
+        </div>
+        <div id="treeSummary" class="tree-summary empty">Load a sample to compare sampled trajectory transitions.</div>
+        <div id="trajectoryTree" class="graph-wrap empty">Load a sample to see its action transition graph.</div>
+      </section>
+
+      <section class="panel">
+        <div class="section-heading">
+          <div>
+            <h2>Trajectory attempts</h2>
+            <p>Click a trajectory id to open a separate step-by-step detail page.</p>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table id="attemptsTable"></table>
+        </div>
+      </section>
+    </main>
+
+    <script type="module" src="/sample.js"></script>
+  </body>
+</html>

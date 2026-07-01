@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ALFWorld Teacher Trajectory Viewer</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <header class="hero">
+      <div>
+        <p class="eyebrow">examples/alfworld</p>
+        <h1>Teacher Trajectory Viewer</h1>
+        <p class="subtitle">Overview dashboard for <code>all_trajectories.jsonl</code>. Sample and trajectory details open on separate pages.</p>
+      </div>
+      <div class="server-badge" id="serverStatus">No directory loaded</div>
+    </header>
+
+    <main>
+      <section class="panel loader">
+        <div class="field grow">
+          <label for="directoryInput">Server directory containing <code>all_trajectories.jsonl</code></label>
+          <input id="directoryInput" placeholder="/data/zhangdw12/outputs/alfworld-teacher" spellcheck="false" />
+        </div>
+        <button id="browseButton">Browse</button>
+        <button id="loadButton" class="primary">Load</button>
+        <button id="refreshButton">Refresh</button>
+        <div class="hint">The service reads files on the machine running <code>npm run dev</code>. It never writes trajectory data.</div>
+        <div id="browsePanel" class="browse-panel hidden"></div>
+      </section>
+
+      <section id="message" class="message hidden"></section>
+
+      <section class="grid cards" id="overviewCards"></section>
+
+      <section class="grid two-col">
+        <article class="panel">
+          <h2>Status distribution</h2>
+          <div id="statusBars" class="bars empty">Load a directory to see status counts.</div>
+        </article>
+        <article class="panel">
+          <h2>Token and step averages</h2>
+          <div id="metricList" class="metric-list empty">No dataset loaded.</div>
+        </article>
+      </section>
+
+      <section class="panel">
+        <div class="section-heading">
+          <div>
+            <h2>Task type analysis</h2>
+            <p>Success rate is computed over trajectory attempts.</p>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table id="taskTypeTable"></table>
+        </div>
+      </section>
+
+      <section class="panel" id="samplesSection">
+        <div class="section-heading">
+          <div>
+            <h2>Samples</h2>
+            <p>One row per original ALFWorld sample. Click a sample id to open its attempts on a separate page.</p>
+          </div>
+          <div class="filters">
+            <input id="sampleSearch" placeholder="Search sample/gamefile" />
+            <select id="sampleStatus"></select>
+            <select id="sampleTaskType"></select>
+            <select id="sampleSplit"></select>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table id="samplesTable"></table>
+        </div>
+        <div class="pager" id="samplesPager"></div>
+      </section>
+
+      <section class="panel" id="trajectoriesSection">
+        <div class="section-heading">
+          <div>
+            <h2>Trajectories</h2>
+            <p id="trajectorySubtitle">All teacher attempts from the loaded JSONL ledger. Click a trajectory id to open a separate detail page.</p>
+          </div>
+          <div class="filters">
+            <input id="trajectorySearch" placeholder="Search id/sample/gamefile" />
+            <select id="trajectoryStatus"></select>
+            <select id="trajectoryTaskType"></select>
+            <select id="trajectorySplit"></select>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table id="trajectoriesTable"></table>
+        </div>
+        <div class="pager" id="trajectoriesPager"></div>
+      </section>
+
+      <section class="panel">
+        <div class="section-heading">
+          <div>
+            <h2>SFT candidates</h2>
+            <p>Shortest successful trajectory per sample. Click a trajectory id to open its detail page.</p>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table id="sftTable"></table>
+        </div>
+        <div class="pager" id="sftPager"></div>
+      </section>
+    </main>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

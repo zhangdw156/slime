@@ -1,0 +1,15 @@
+{
+  "name": "alfworld-trajectory-viewer",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Read-only ALFWorld teacher trajectory browser and analysis dashboard.",
+  "scripts": {
+    "dev": "node server/server.js",
+    "test": "node --test server/*.test.js public/*.test.js",
+    "check": "node --check server/server.js && node --check server/data.js && node --check public/common.js && node --check public/tree.js && node --check public/app.js && node --check public/sample.js && node --check public/trajectory.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
