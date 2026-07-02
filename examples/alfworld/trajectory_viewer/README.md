@@ -54,10 +54,18 @@ index, and keeps byte offsets so full trajectory details can be loaded on demand
 - Sample page (`/sample.html?id=<sample_id>`): one sample's attempts in a
   focused page, plus an action transition graph. The graph merges the same
   action into one shared node even when sampled trajectories diverge and later
-  converge, with edges showing observed adjacent-action transitions. The
-  default graph view is compact: it shows high-frequency transitions first,
-  supports an all-transition toggle, and lets you click a node to focus all of
-  its incoming/outgoing transitions.
+  converge. The default graph view overlays one colored path per sampled
+  trajectory on the shared action nodes, includes a trajectory legend, and lets
+  you click a trajectory to highlight its full path. The selected trajectory's
+  order is shown on node badges (edges do not carry step numbers), and the path
+  strip keeps repeated visits to the same merged action readable. Nodes stay
+  compact by default; clicking a node opens a detail panel
+  with visit counts, status mix, trajectory ids, and an optional button to focus
+  its incoming/outgoing transitions. The same page also renders a state
+  transition graph whose nodes are observations and whose edges are actions, so
+  branch points show the concrete observation states that led to different next
+  actions. A major-transition toggle is still available for compact aggregate
+  views.
 - Trajectory page (`/trajectory.html?id=<trajectory_id>`): step-by-step
   observation, system/user prompt, teacher response, admissible actions, parsed
   action, validity, reward, and token counts.

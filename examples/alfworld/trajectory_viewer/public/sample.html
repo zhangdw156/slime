@@ -22,17 +22,26 @@
       </nav>
       <section id="message" class="message hidden"></section>
       <section class="grid cards" id="sampleCards"></section>
-      <section id="gamefilePath" class="path-note hidden"></section>
-
       <section class="panel">
         <div class="section-heading">
           <div>
             <h2>Action transition graph</h2>
-            <p>Readable overview of all sampled trajectories. The same action is one shared node; the default view keeps only high-frequency transitions and lets you focus any node.</p>
+            <p>One graph for all sampled trajectories. The same action is one shared node; click a trajectory to highlight its path and show step order on nodes.</p>
           </div>
         </div>
         <div id="treeSummary" class="tree-summary empty">Load a sample to compare sampled trajectory transitions.</div>
         <div id="trajectoryTree" class="graph-wrap empty">Load a sample to see its action transition graph.</div>
+      </section>
+
+      <section class="panel">
+        <div class="section-heading">
+          <div>
+            <h2>State transition graph</h2>
+            <p>States are observations; edges are actions. Branch state nodes show exactly which observations led to different next actions.</p>
+          </div>
+        </div>
+        <div id="stateTreeSummary" class="tree-summary empty">Load a sample to compare observed state transitions.</div>
+        <div id="stateTransitionTree" class="graph-wrap empty">Load a sample to see its state transition graph.</div>
       </section>
 
       <section class="panel">
