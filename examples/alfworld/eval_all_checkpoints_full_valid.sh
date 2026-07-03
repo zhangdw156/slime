@@ -22,9 +22,10 @@ TRAIN_SCRIPT=${TRAIN_SCRIPT:-${SCRIPT_DIR}/run_qwen2.5_3B_instruct_sft_full_eval
 CUSTOM_LOGGER_PATH=${CUSTOM_LOGGER_PATH:-${SCRIPT_DIR}/checkpoint_eval_logger.py}
 CUSTOM_LOGGER_FUNC=${CUSTOM_LOGGER_FUNC:-checkpoint_eval_logger.log_eval_at_checkpoint_step}
 
-# -------- Paths: aligned with run_qwen2.5_3B_instruct_sft_full_eval.sh. --------
+# -------- Paths: defaults target the 3B SFT sweep; override for other model families. --------
 SLIME_ROOT=${SLIME_ROOT:-/data/zhangdw12/work/slime}
 MEGATRON_ROOT=${MEGATRON_ROOT:-/data/zhangdw12/work/Megatron-LM}
+MODEL_ARGS_SCRIPT=${MODEL_ARGS_SCRIPT:-qwen2.5-3B.sh}
 MODEL_ROOT=${MODEL_ROOT:-/data/zhangdw12/models/Qwen2.5-3B-Instruct}
 MCORE_CKPT=${MCORE_CKPT:-/data/zhangdw12/models/Qwen2.5-3B-Instruct_torch_dist}
 SLIME_CKPT=${SLIME_CKPT:-/data/zhangdw12/models/Qwen2.5-3B-Instruct_alfworld_sft_slime}
@@ -68,6 +69,8 @@ RAY_CORE_PORT_SEARCH_START=${RAY_CORE_PORT_SEARCH_START:-29379}
 RAY_CORE_PORT_SEARCH_END=${RAY_CORE_PORT_SEARCH_END:-39999}
 RAY_NUM_CPUS=${RAY_NUM_CPUS:-32}
 RAY_TEMP_ROOT=${RAY_TEMP_ROOT:-/data/zhangdw12/r}
+RAY_TMP_PREFIX=${RAY_TMP_PREFIX:-ra_sft_ckpt}
+JOB_TMP_PREFIX=${JOB_TMP_PREFIX:-alfworld_sft_ckpt_eval}
 RAY_CLEANUP_ON_EXIT=${RAY_CLEANUP_ON_EXIT:-1}
 RAY_CLEAN_STALE_ON_START=${RAY_CLEAN_STALE_ON_START:-1}
 ACTIVE_RAY_TMPDIR=""
@@ -77,6 +80,7 @@ EVAL_TRACKING_ROOT=${EVAL_TRACKING_ROOT:-${SLIME_CKPT}/all_ckpt_full_eval_tracki
 SWANLAB_PROJECT=${SWANLAB_PROJECT:-slime-alfworld}
 SWANLAB_GROUP=${SWANLAB_GROUP:-qwen2.5-3B-instruct-sft-all-ckpts-full-eval}
 SWANLAB_EXPERIMENT_NAME=${SWANLAB_EXPERIMENT_NAME:-qwen2.5-3B-instruct-sft-all-checkpoints-full-valid}
+SWEEP_ID_PREFIX=${SWEEP_ID_PREFIX:-sft3b-allckpt}
 
 # SWEEP_ID isolates local logs/state/done markers for this all-checkpoint eval.
 # Default is a fresh id to avoid silently mixing a new evaluation with old done
@@ -86,7 +90,7 @@ if [[ -z "${SWEEP_ID:-}" ]]; then
   SWEEP_ID=${TRAIN_RUN_ID:-${SWANLAB_RUN_ID:-}}
 fi
 if [[ -z "${SWEEP_ID:-}" ]]; then
-  SWEEP_ID="sft3b-allckpt-$(date +%y%m%d-%H%M%S)"
+  SWEEP_ID="${SWEEP_ID_PREFIX}-$(date +%y%m%d-%H%M%S)"
 fi
 case "${SWEEP_ID}" in
   *"/"*|*".."*|"")
@@ -155,6 +159,9 @@ init_sweep_state() {
     printf 'swanlab_project=%s\n' "${SWANLAB_PROJECT}"
     printf 'swanlab_group=%s\n' "${SWANLAB_GROUP}"
     printf 'swanlab_experiment_name=%s\n' "${SWANLAB_EXPERIMENT_NAME}"
+    printf 'model_args_script=%s\n' "${MODEL_ARGS_SCRIPT}"
+    printf 'model_root=%s\n' "${MODEL_ROOT}"
+    printf 'mcore_ckpt=%s\n' "${MCORE_CKPT}"
     printf 'slime_ckpt=%s\n' "${SLIME_CKPT}"
     date -Iseconds | sed 's/^/created_or_resumed_at=/'
   } > "${SWEEP_STATE_DIR}/sweep_metadata.env"
@@ -320,7 +327,7 @@ preflight() {
   fi
   require_path "${CUSTOM_LOGGER_PATH}" "custom checkpoint eval logger"
   require_path "${SLIME_ROOT}/train.py" "slime train.py"
-  require_path "${SLIME_ROOT}/scripts/models/qwen2.5-3B.sh" "Qwen2.5-3B model args"
+  require_path "${SLIME_ROOT}/scripts/models/${MODEL_ARGS_SCRIPT}" "model args script ${MODEL_ARGS_SCRIPT}"
   require_path "${MEGATRON_ROOT}" "Megatron-LM root"
   require_path "${MODEL_ROOT}" "HF model root"
   require_path "${MCORE_CKPT}/latest_checkpointed_iteration.txt" "Megatron torch_dist checkpoint marker"
@@ -412,7 +419,7 @@ start_ray_for_step() {
       echo "ERROR: START_RAY=0 requires RAY_ADDRESS=<host:port> for the existing Ray cluster." >&2
       exit 2
     fi
-    local job_tmp="${JOB_TMP_BASE:-/data/zhangdw12/tmp}/alfworld_sft3b_ckpt_eval_${step}_${SLURM_JOB_ID:-$$}"
+    local job_tmp="${JOB_TMP_BASE:-/data/zhangdw12/tmp}/${JOB_TMP_PREFIX}_${step}_${SLURM_JOB_ID:-$$}"
     mkdir -p "${job_tmp}"
     export TMPDIR="${job_tmp}"
     export TEMP="${job_tmp}"
@@ -429,8 +436,8 @@ start_ray_for_step() {
     eval_ray_port=$((RAY_PORT_BASE + idx))
   fi
 
-  local ray_tmpdir="${RAY_TEMP_ROOT%/}/ra_sft3b_ckpt_${step}"
-  local job_tmp="${JOB_TMP_BASE:-/data/zhangdw12/tmp}/alfworld_sft3b_ckpt_eval_${step}_${SLURM_JOB_ID:-$$}"
+  local ray_tmpdir="${RAY_TEMP_ROOT%/}/${RAY_TMP_PREFIX}_${step}"
+  local job_tmp="${JOB_TMP_BASE:-/data/zhangdw12/tmp}/${JOB_TMP_PREFIX}_${step}_${SLURM_JOB_ID:-$$}"
   check_ray_temp_dir_short "${ray_tmpdir}"
   mkdir -p "${ray_tmpdir}" "${job_tmp}"
   if [[ "${RAY_CLEAN_STALE_ON_START}" == "1" ]]; then
@@ -492,7 +499,11 @@ run_eval_step() {
   cd "${SLIME_ROOT}"
   unset MODEL_ARGS || true
   # shellcheck source=/dev/null
-  source "${SLIME_ROOT}/scripts/models/qwen2.5-3B.sh"
+  source "${SLIME_ROOT}/scripts/models/${MODEL_ARGS_SCRIPT}"
+  if [[ "${#MODEL_ARGS[@]}" -eq 0 ]]; then
+    echo "ERROR: ${MODEL_ARGS_SCRIPT} did not define MODEL_ARGS" >&2
+    exit 2
+  fi
   export PYTHONPATH="${SCRIPT_DIR}:${MEGATRON_ROOT}:${SLIME_ROOT}:${ALFWORLD_EXAMPLE_DIR}:${PYTHONPATH:-}"
   export CUDA_DEVICE_MAX_CONNECTIONS=1
   export CHECKPOINT_EVAL_STEP="${step}"
@@ -613,6 +624,7 @@ run_eval_step() {
 
   local log_file="${EVAL_LOG_DIR}/eval_step_${step}.log"
   echo "========== Full-valid eval checkpoint ${step} ==========" | tee "${log_file}"
+  echo "Model args script: ${MODEL_ARGS_SCRIPT}" | tee -a "${log_file}"
   echo "SwanLab: project=${SWANLAB_PROJECT}, experiment=${SWANLAB_EXPERIMENT_NAME}, run_id=${SWANLAB_RUN_ID}, x-axis step=${step}" | tee -a "${log_file}"
 
   set +e

@@ -4,6 +4,8 @@ This example trains `Qwen2.5-3B-Instruct` with slime GRPO in the ALFWorld TextWo
 
 The GRPO script is intended to reproduce the ALFWorld GRPO experiment from the SDAR paper [Self-Distilled Agentic Reinforcement Learning](https://arxiv.org/abs/2605.15155) by Meituan and Zhejiang University. The GRPO+OPSD script keeps the same ALFWorld rollout and reward path, but when `--use-opd --opd-type self` is enabled it scores each student step response under SDAR-style privileged ALFWorld skills on the current rollout SGLang router and passes `teacher_log_probs` to slime's existing OPD machinery. The pure OPSD script uses the same teacher-logprob path but sets processed training rewards to `0.0`, so the OPD term is the policy signal.
 
+Unless a launcher or experiment note explicitly marks an ablation/comparison setting, every experiment under `examples/alfworld` uses `ALFWORLD_HISTORY_LENGTH=4` by default. Keep `ALFWORLD_HISTORY_LENGTH=4` for standard training, SFT, OPD/OPSD, and full-valid evaluation runs; use another value only for intentionally named history-length ablations.
+
 ## 1. Environment setup
 
 Start from a working slime environment, then install the ALFWorld dependencies:
@@ -252,6 +254,19 @@ It scans `SLIME_CKPT/iter_*`, evaluates each saved checkpoint on the same full
 valid splits, and logs all results into one SwanLab run with the checkpoint step
 as the tracker step. Reuse the printed `SWEEP_ID` to resume a partially finished
 sweep without mixing it with a new experiment.
+
+For a Qwen2.5-0.5B SFT checkpoint sweep, override the model-args script and
+checkpoint roots while keeping the standard `ALFWORLD_HISTORY_LENGTH=4`:
+
+```bash
+cd /root/slime
+MODEL_ARGS_SCRIPT=qwen2.5-0.5B.sh \
+MODEL_ROOT=/root/Qwen2.5-0.5B-Instruct \
+MCORE_CKPT=/root/Qwen2.5-0.5B-Instruct_torch_dist \
+SLIME_CKPT=/root/Qwen2.5-0.5B-Instruct_alfworld_sft_slime \
+SWEEP_ID_PREFIX=sft0p5b-allckpt \
+bash examples/alfworld/eval_all_checkpoints_full_valid.sh
+```
 
 ## Docker executable entrypoints
 
