@@ -256,7 +256,9 @@ as the tracker step. Reuse the printed `SWEEP_ID` to resume a partially finished
 sweep without mixing it with a new experiment.
 
 For a Qwen2.5-0.5B SFT checkpoint sweep, override the model-args script and
-checkpoint roots while keeping the standard `ALFWORLD_HISTORY_LENGTH=4`:
+checkpoint roots while keeping the standard `ALFWORLD_HISTORY_LENGTH=4`. The
+SwanLab group, experiment name, and sweep-id prefix are derived from
+`MODEL_ARGS_SCRIPT` unless explicitly overridden:
 
 ```bash
 cd /root/slime
@@ -264,7 +266,6 @@ MODEL_ARGS_SCRIPT=qwen2.5-0.5B.sh \
 MODEL_ROOT=/root/Qwen2.5-0.5B-Instruct \
 MCORE_CKPT=/root/Qwen2.5-0.5B-Instruct_torch_dist \
 SLIME_CKPT=/root/Qwen2.5-0.5B-Instruct_alfworld_sft_slime \
-SWEEP_ID_PREFIX=sft0p5b-allckpt \
 bash examples/alfworld/eval_all_checkpoints_full_valid.sh
 ```
 

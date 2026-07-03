@@ -76,11 +76,32 @@ RAY_CLEAN_STALE_ON_START=${RAY_CLEAN_STALE_ON_START:-1}
 ACTIVE_RAY_TMPDIR=""
 
 # -------- One SwanLab experiment for the whole checkpoint sweep. --------
+# Derive tracker defaults from the selected model-args script so overriding
+# MODEL_ARGS_SCRIPT for 0.5B does not accidentally keep 3B tracker names.
+case "${MODEL_ARGS_SCRIPT}" in
+  qwen2.5-0.5B.sh)
+    DEFAULT_SWANLAB_GROUP="qwen2.5-0.5B-instruct-sft-all-ckpts-full-eval"
+    DEFAULT_SWANLAB_EXPERIMENT_NAME="qwen2.5-0.5B-instruct-sft-all-checkpoints-full-valid"
+    DEFAULT_SWEEP_ID_PREFIX="sft0p5b-allckpt"
+    ;;
+  qwen2.5-3B.sh)
+    DEFAULT_SWANLAB_GROUP="qwen2.5-3B-instruct-sft-all-ckpts-full-eval"
+    DEFAULT_SWANLAB_EXPERIMENT_NAME="qwen2.5-3B-instruct-sft-all-checkpoints-full-valid"
+    DEFAULT_SWEEP_ID_PREFIX="sft3b-allckpt"
+    ;;
+  *)
+    model_label=$(basename "${MODEL_ARGS_SCRIPT}" .sh)
+    model_label=${model_label//[^A-Za-z0-9._-]/-}
+    DEFAULT_SWANLAB_GROUP="${model_label}-sft-all-ckpts-full-eval"
+    DEFAULT_SWANLAB_EXPERIMENT_NAME="${model_label}-sft-all-checkpoints-full-valid"
+    DEFAULT_SWEEP_ID_PREFIX="${model_label}-allckpt"
+    ;;
+esac
 EVAL_TRACKING_ROOT=${EVAL_TRACKING_ROOT:-${SLIME_CKPT}/all_ckpt_full_eval_tracking}
 SWANLAB_PROJECT=${SWANLAB_PROJECT:-slime-alfworld}
-SWANLAB_GROUP=${SWANLAB_GROUP:-qwen2.5-3B-instruct-sft-all-ckpts-full-eval}
-SWANLAB_EXPERIMENT_NAME=${SWANLAB_EXPERIMENT_NAME:-qwen2.5-3B-instruct-sft-all-checkpoints-full-valid}
-SWEEP_ID_PREFIX=${SWEEP_ID_PREFIX:-sft3b-allckpt}
+SWANLAB_GROUP=${SWANLAB_GROUP:-${DEFAULT_SWANLAB_GROUP}}
+SWANLAB_EXPERIMENT_NAME=${SWANLAB_EXPERIMENT_NAME:-${DEFAULT_SWANLAB_EXPERIMENT_NAME}}
+SWEEP_ID_PREFIX=${SWEEP_ID_PREFIX:-${DEFAULT_SWEEP_ID_PREFIX}}
 
 # SWEEP_ID isolates local logs/state/done markers for this all-checkpoint eval.
 # Default is a fresh id to avoid silently mixing a new evaluation with old done
