@@ -12,6 +12,7 @@ This example trains `Qwen2.5-3B-Instruct` with slime GRPO against a separately d
 | `prepare_webshop_data.py` | Builds lightweight WebShop goal metadata JSONL files: `train.jsonl` and `valid.jsonl`. |
 | `run_qwen2.5_3B_instruct_grpo.sh` | Qwen2.5-3B-Instruct GRPO launcher with WebShop small synthetic defaults. |
 | `eval_qwen2.5_3B_instruct_full_valid.sh` | Eval-only launcher for the full 500-goal held-out validation pool. |
+| `SEARCH_INDEX_TROUBLESHOOTING.md` | Postmortem and runbook for the failure where `success_rate` stayed at 0 because `indexes_1k` was empty or stale. |
 
 ## 1. Start the WebShop service
 
