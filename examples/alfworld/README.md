@@ -247,6 +247,12 @@ training. Metrics are logged under names such as
 default, matching the training launchers; set `USE_SWANLAB=0` to disable it,
 `USE_WANDB=1` to enable W&B, or `USE_TENSORBOARD=1` to enable TensorBoard.
 
+For post-training checkpoint sweeps, use `eval_all_checkpoints_full_valid.sh`.
+It scans `SLIME_CKPT/iter_*`, evaluates each saved checkpoint on the same full
+valid splits, and logs all results into one SwanLab run with the checkpoint step
+as the tracker step. Reuse the printed `SWEEP_ID` to resume a partially finished
+sweep without mixing it with a new experiment.
+
 ## Docker executable entrypoints
 
 Run these commands from the repository root inside the container, normally
@@ -264,6 +270,7 @@ be overridden with environment variables shown above.
 | `run_qwen2.5_0.5B_instruct_sft.sh` | `bash examples/alfworld/run_qwen2.5_0.5B_instruct_sft.sh` | 0.5B HF + torch_dist checkpoints and SFT JSONL | SFT student checkpoint; optional ALFWorld eval when `USE_EVAL=1` |
 | `run_qwen2.5_0.5B_instruct_opd_from_3B.sh` | `bash examples/alfworld/run_qwen2.5_0.5B_instruct_opd_from_3B.sh` | 0.5B HF + torch_dist checkpoints, prepared game indices, trained 3B SGLang `/generate` endpoint | Native slime OPD training of the 0.5B student from the 3B teacher |
 | `eval_qwen2.5_3B_instruct_full_valid.sh` | `bash examples/alfworld/eval_qwen2.5_3B_instruct_full_valid.sh` | trained 3B slime checkpoint and full ALFWorld data | full `valid_seen` / `valid_unseen` metrics |
+| `eval_all_checkpoints_full_valid.sh` | `bash examples/alfworld/eval_all_checkpoints_full_valid.sh` | trained slime checkpoint root with `iter_*` saves and full ALFWorld data | one SwanLab run containing full-valid metrics for every checkpoint step |
 
 The remaining Python files in this directory (`batched_rollout.py`,
 `generate_with_alfworld.py`, `opsd.py`, `alfworld_env.py`, and `prompts.py`) are
@@ -292,6 +299,8 @@ imported by the entrypoints above rather than launched directly.
 | `run_qwen2.5_0.5B_instruct_sft.sh` | SFT launcher for distilling 3B teacher ALFWorld data into Qwen2.5-0.5B-Instruct |
 | `run_qwen2.5_0.5B_instruct_opd_from_3B.sh` | native slime OPD launcher for online ALFWorld 0.5B rollouts scored by a trained 3B SGLang teacher |
 | `eval_qwen2.5_3B_instruct_full_valid.sh` | eval-only launcher that regenerates full valid_seen/valid_unseen indices and logs full-split metrics |
+| `eval_all_checkpoints_full_valid.sh` | eval-only checkpoint sweep launcher that logs every `iter_*` full-valid result into one SwanLab run |
+| `checkpoint_eval_logger.py` | custom eval logger that uses checkpoint step as the SwanLab/TensorBoard step |
 | `collect_teacher_trajectories.py` | collects all teacher trajectory attempts from a running 3B teacher endpoint |
 | `build_sft_from_teacher_trajectories.py` | filters successful teacher trajectories into messages-format SFT data |
 | `batched_rollout.py` | custom batched ALFWorld rollout function used by `--rollout-function-path` |
