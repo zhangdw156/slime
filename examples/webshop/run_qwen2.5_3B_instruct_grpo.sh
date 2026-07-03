@@ -38,6 +38,7 @@ SLIME_CKPT=${SLIME_CKPT:-/root/Qwen2.5-3B-Instruct_webshop_grpo_slime}
 WEBSHOP_TASK_DIR=${WEBSHOP_TASK_DIR:-/root/slime-webshop}
 export WEBSHOP_SERVICE_URL=${WEBSHOP_SERVICE_URL:-http://127.0.0.1:3001}
 export WEBSHOP_HISTORY_LENGTH=${WEBSHOP_HISTORY_LENGTH:-4}
+export WEBSHOP_REWARD_MODE=${WEBSHOP_REWARD_MODE:-dense}
 
 require_path() {
    local path="$1"
@@ -68,7 +69,10 @@ if goals <= 0:
 expected = 6910
 if goals != expected:
     raise SystemExit(f"ERROR: expected {expected} WebShop small synthetic goals, got {goals}: {payload}")
-print(json.dumps({"webshop_service": url, "goals": goals, "sessions": payload.get("sessions")}, indent=2))
+num_products = payload.get("num_products")
+if num_products not in (1000, "1000"):
+    raise SystemExit(f"ERROR: expected WebShop service num_products=1000 for small synthetic goals, got {num_products}: {payload}")
+print(json.dumps({"webshop_service": url, "goals": goals, "num_products": num_products, "sessions": payload.get("sessions")}, indent=2))
 PY
 }
 
@@ -218,7 +222,8 @@ RUNTIME_ENV_JSON="{
     \"PYTHONPATH\": \"/root/Megatron-LM/:${SCRIPT_DIR}\",
     \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
     \"WEBSHOP_SERVICE_URL\": \"${WEBSHOP_SERVICE_URL}\",
-    \"WEBSHOP_HISTORY_LENGTH\": \"${WEBSHOP_HISTORY_LENGTH}\"
+    \"WEBSHOP_HISTORY_LENGTH\": \"${WEBSHOP_HISTORY_LENGTH}\",
+    \"WEBSHOP_REWARD_MODE\": \"${WEBSHOP_REWARD_MODE}\"
   }
 }"
 

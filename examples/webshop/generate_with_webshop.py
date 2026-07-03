@@ -34,6 +34,8 @@ DEFAULT_HISTORY_LENGTH = 4
 DEFAULT_STEP_MAX_TOKENS = 512
 DEFAULT_MAX_PROMPT_CHARS = 13000
 DEFAULT_INVALID_ACTION_PENALTY = 0.1
+DEFAULT_REWARD_MODE = "dense"
+SUPPORTED_REWARD_MODES = {"binary", "dense"}
 
 
 def _get_int_env(name: str, default: int) -> int:
@@ -42,6 +44,19 @@ def _get_int_env(name: str, default: int) -> int:
     except ValueError:
         logger.warning("Invalid integer for %s=%r; using %s", name, os.environ.get(name), default)
         return default
+
+
+def _get_reward_mode() -> str:
+    mode = os.environ.get("WEBSHOP_REWARD_MODE", DEFAULT_REWARD_MODE).strip().lower()
+    if mode in SUPPORTED_REWARD_MODES:
+        return mode
+    logger.warning(
+        "Unsupported WEBSHOP_REWARD_MODE=%r; using %s. Supported modes: %s",
+        os.environ.get("WEBSHOP_REWARD_MODE"),
+        DEFAULT_REWARD_MODE,
+        sorted(SUPPORTED_REWARD_MODES),
+    )
+    return DEFAULT_REWARD_MODE
 
 
 def _get_metadata(sample: Sample) -> dict[str, Any]:
@@ -142,8 +157,32 @@ def _goal_seed_from_sample(metadata: dict[str, Any]) -> int | None:
     return int(metadata["goal_seed"])
 
 
-def _episode_reward_from_raw(*, raw_reward: float, done: bool) -> float:
-    return 10.0 if done and raw_reward >= 1.0 else 0.0
+def _episode_reward_from_raw(*, raw_reward: float, done: bool, reward_mode: str | None = None) -> float:
+    if not done:
+        return 0.0
+
+    mode = reward_mode or _get_reward_mode()
+    if mode == "binary":
+        return 10.0 if raw_reward >= 1.0 else 0.0
+
+    # Dense mode keeps WebShop's partial-match reward signal while preserving
+    # the previous full-success scale of 10.0.
+    return 10.0 * max(0.0, min(1.0, float(raw_reward)))
+
+
+def _service_action_from_projection(parsed_action: str, projected_action: str) -> str:
+    """Use the normalized parser action when it is a WebShop action string.
+
+    ``_project_action_like_sdar`` intentionally mirrors SDAR's loose action
+    projection for invalid-action accounting, but the HTTP service performs an
+    exact match against current clickables.  Sending ``parse_action``'s
+    whitespace-normalized action prevents harmless formatting differences such
+    as ``click[Buy  Now]`` from becoming service-side no-ops.
+    """
+
+    if parsed_action.startswith(("search[", "click[")):
+        return parsed_action
+    return projected_action
 
 
 def _step_reward(*, episode_reward: float, valid_action: bool, invalid_action_penalty: float) -> float:
@@ -185,6 +224,7 @@ def _episode_metadata(
     invalid_action_count: int,
     invalid_action_penalty: float,
     done: bool,
+    reward_mode: str,
 ) -> dict[str, Any]:
     info = final_state.get("info", {}) if isinstance(final_state, dict) else {}
     return {
@@ -193,9 +233,10 @@ def _episode_metadata(
         "instruction_text": instruction_text,
         "trajectory": trajectory,
         "raw_reward": raw_reward,
-        "episode_reward": _episode_reward_from_raw(raw_reward=raw_reward, done=done),
+        "episode_reward": _episode_reward_from_raw(raw_reward=raw_reward, done=done, reward_mode=reward_mode),
         "final_reward": final_reward,
         "done": done,
+        "reward_mode": reward_mode,
         "invalid_action_count": invalid_action_count,
         "invalid_action_penalty": invalid_action_penalty,
         "reward_info": info.get("reward_info"),
@@ -225,6 +266,7 @@ async def generate(
     step_max_tokens = DEFAULT_STEP_MAX_TOKENS
     max_prompt_chars = DEFAULT_MAX_PROMPT_CHARS
     invalid_action_penalty = DEFAULT_INVALID_ACTION_PENALTY
+    reward_mode = _get_reward_mode()
 
     goal_idx = _goal_idx_from_sample(metadata)
     goal_seed = _goal_seed_from_sample(metadata)
@@ -291,7 +333,8 @@ async def generate(
             assistant_response_tokens.extend(response_tokens)
 
             parsed = parse_action(response, available_actions)
-            service_action, valid_for_penalty, projection_invalid_reason = _project_action_like_sdar(response)
+            projected_action, valid_for_penalty, projection_invalid_reason = _project_action_like_sdar(response)
+            service_action = _service_action_from_projection(parsed.action, projected_action)
             if not valid_for_penalty:
                 invalid_action_count += 1
 
@@ -304,6 +347,7 @@ async def generate(
                 "observation": current_observation,
                 "model_response": response,
                 "parsed_action": parsed.action,
+                "projected_action": projected_action,
                 "service_action": service_action,
                 "valid_action": valid_for_penalty,
                 "admissible_action": parsed.valid_admissible,
@@ -347,7 +391,7 @@ async def generate(
     finally:
         await close_session(sample.session_id)
 
-    episode_reward = _episode_reward_from_raw(raw_reward=raw_reward, done=done)
+    episode_reward = _episode_reward_from_raw(raw_reward=raw_reward, done=done, reward_mode=reward_mode)
     final_reward = episode_reward - invalid_action_penalty * invalid_action_count
     episode_metadata = _episode_metadata(
         metadata=metadata,
@@ -360,6 +404,7 @@ async def generate(
         invalid_action_count=invalid_action_count,
         invalid_action_penalty=invalid_action_penalty,
         done=done,
+        reward_mode=reward_mode,
     )
 
     if evaluation:
