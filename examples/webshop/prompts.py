@@ -10,39 +10,48 @@ WEBSHOP_SYSTEM_PROMPT = (
     "At every turn, return exactly one valid WebShop action."
 )
 
-WEBSHOP_TEMPLATE_NO_HIS = """User instruction: {instruction_text}
+WEBSHOP_SEARCH_GUIDANCE = """WebShop search guidance:
+- Use search[<your query>] with a short core product query, such as the product type or category.
+- Do not put color, size, price, or every requested attribute into search[<your query>]. Handle those by opening a product page and selecting/clicking options when available.
+- If a search returns zero results, retry with a shorter broader product query, not a longer query.
+- The goal is to inspect/select a matching product and eventually click[buy now]."""
 
-Current WebShop observation:
+
+WEBSHOP_TEMPLATE_NO_HIS = """Your task is to: {instruction_text}.
+
+Your current observation is:
 {current_observation}
 
-Available actions:
+Your admissible actions of the current situation are:
+[
 {available_actions}
+].
 
-Now choose the next action.
-You should first reason briefly inside <think> </think> tags.
-Then output exactly one action inside <action> </action> tags.
-The action must be one of these forms:
-- search[keywords] if the search bar is available
-- click[button_or_option_text] using one of the listed clickable texts
+Now it's your turn to take one action for the current step.
+You should first reason step-by-step about the current situation, then think carefully which admissible action best advances the shopping goal. This reasoning process MUST be enclosed within <think> </think> tags.
+Once you've finished your reasoning, choose exactly one admissible action for the current step and present it within <action> </action> tags.
+
+{search_guidance}
 """
 
-WEBSHOP_TEMPLATE = """User instruction: {instruction_text}
+WEBSHOP_TEMPLATE = """Your task is to: {instruction_text}.
 
-Recent interaction history:
+Prior to this step, you have already taken {step_count} step(s). Below are the most recent {history_length} observations and the corresponding actions you took:
 {action_history}
 
-Current WebShop observation:
+You are now at step {current_step} and your current observation is:
 {current_observation}
 
-Available actions:
+Your admissible actions of the current situation are:
+[
 {available_actions}
+].
 
-Now choose the next action.
-You should first reason briefly inside <think> </think> tags.
-Then output exactly one action inside <action> </action> tags.
-The action must be one of these forms:
-- search[keywords] if the search bar is available
-- click[button_or_option_text] using one of the listed clickable texts
+Now it's your turn to take one action for the current step.
+You should first reason step-by-step about the current situation, then think carefully which admissible action best advances the shopping goal. This reasoning process MUST be enclosed within <think> </think> tags.
+Once you've finished your reasoning, choose exactly one admissible action for the current step and present it within <action> </action> tags.
+
+{search_guidance}
 """
 
 _ACTION_RE = re.compile(r"<action>(.*?)</action>", flags=re.IGNORECASE | re.DOTALL)
@@ -72,14 +81,14 @@ def _clickables(available_actions: dict) -> set[str]:
 
 
 def format_available_actions(available_actions: dict) -> str:
-    lines: list[str] = []
+    actions: list[str] = []
     if available_actions.get("has_search_bar"):
-        lines.append("- search[keywords]")
+        actions.append("search[<your query>]")
     clickables = [normalize_clickable(item) for item in available_actions.get("clickables", [])]
     for clickable in clickables:
         if clickable and clickable != "search":
-            lines.append(f"- click[{clickable}]")
-    return "\n".join(lines) if lines else "- no valid actions"
+            actions.append(f"click[{clickable}]")
+    return "\n".join(f"'{action}'," for action in actions) if actions else "'no valid actions',"
 
 
 def build_observation_prompt(
@@ -100,6 +109,7 @@ def build_observation_prompt(
             instruction_text=instruction_text,
             current_observation=current_observation,
             available_actions=formatted_actions,
+            search_guidance=WEBSHOP_SEARCH_GUIDANCE,
         )
         return prompt, 0
 
@@ -112,15 +122,20 @@ def build_observation_prompt(
         )
     prompt = WEBSHOP_TEMPLATE.format(
         instruction_text=instruction_text,
+        step_count=len(history),
+        history_length=len(recent_history),
         action_history="\n\n".join(history_parts),
+        current_step=len(history) + 1,
         current_observation=current_observation,
         available_actions=formatted_actions,
+        search_guidance=WEBSHOP_SEARCH_GUIDANCE,
     )
     if max_prompt_chars > 0 and len(prompt) > max_prompt_chars:
         prompt = WEBSHOP_TEMPLATE_NO_HIS.format(
             instruction_text=instruction_text,
             current_observation=current_observation,
             available_actions=formatted_actions,
+            search_guidance=WEBSHOP_SEARCH_GUIDANCE,
         )
         return prompt, 0
     return prompt, len(recent_history)
