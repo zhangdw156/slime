@@ -12,6 +12,8 @@ This example trains `Qwen2.5-3B-Instruct` with slime GRPO against a separately d
 | `prepare_webshop_data.py` | Builds lightweight WebShop goal metadata JSONL files: `train.jsonl` and `valid.jsonl`. |
 | `run_qwen2.5_3B_instruct_grpo.sh` | Qwen2.5-3B-Instruct GRPO launcher with WebShop small synthetic defaults. |
 | `eval_qwen2.5_3B_instruct_full_valid.sh` | Eval-only launcher for the full 500-goal held-out validation pool. |
+| `eval_all_checkpoints_full_valid.sh` | Eval-only sweep over every saved checkpoint; logs all full-valid scores into one SwanLab run with checkpoint step as the x-axis. |
+| `checkpoint_eval_logger.py` | Custom eval logger used by the checkpoint sweep to force `eval/step = CKPT_STEP`. |
 | `SEARCH_INDEX_TROUBLESHOOTING.md` | Postmortem and runbook for the failure where `success_rate` stayed at 0 because `indexes_1k` was empty or stale. |
 
 ## 1. Start the WebShop service
@@ -97,3 +99,27 @@ bash examples/webshop/eval_qwen2.5_3B_instruct_full_valid.sh
 By default the script loads the latest checkpoint recorded by `latest_checkpointed_iteration.txt`. To evaluate a specific saved checkpoint, set `CKPT_STEP`; for example, `CKPT_STEP=50` loads `iter_0000050` from `SLIME_CKPT`.
 
 The script runs slime in eval-only mode with `--num-rollout 0` and `--eval-interval 1`, generates `valid_full.jsonl` with `goal_idx` 0 through 499, logs metrics under `eval/valid_full/...`, and exits without training.
+
+
+## 5. Sweep all checkpoints on full validation
+
+Use the all-checkpoint full-valid launcher when you want one SwanLab experiment containing every saved checkpoint's full 500-goal validation score. The sweep scans `SLIME_CKPT/iter_*` by default, evaluates each checkpoint serially, and passes the same `SWANLAB_RUN_ID` to every eval-only run. The custom logger writes `eval/step` as the checkpoint step, so SwanLab's x-axis is the checkpoint number rather than the eval rollout id.
+
+```bash
+MODEL_ROOT=/data/zhangdw12/models/Qwen2.5-3B-Instruct \
+MCORE_CKPT=/data/zhangdw12/models/Qwen2.5-3B-Instruct_torch_dist \
+SLIME_CKPT=/data/zhangdw12/models/Qwen2.5-3B-Instruct_webshop_grpo_slime \
+WEBSHOP_SERVICE_URL=http://superagent-ai02:3001 \
+WEBSHOP_FULL_EVAL_TASK_DIR=/data/zhangdw12/datasets/slime-webshop-full-eval \
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+NUM_GPUS=4 \
+bash examples/webshop/eval_all_checkpoints_full_valid.sh
+```
+
+To evaluate only selected checkpoints, pass comma-separated steps:
+
+```bash
+CKPT_STEPS=10,20,30 bash examples/webshop/eval_all_checkpoints_full_valid.sh
+```
+
+To resume a failed sweep into the same SwanLab run, reuse the printed `SWEEP_ID` or `SWANLAB_RUN_ID`. Done markers and local logs are stored under `${SLIME_CKPT}/all_ckpt_full_eval_tracking/` by default; `SKIP_EXISTING=1` skips checkpoints already completed for the same sweep/run id.
