@@ -44,6 +44,36 @@ class WebShopGenerateRewardTest(unittest.TestCase):
     def tearDown(self):
         os.environ.pop("WEBSHOP_REWARD_MODE", None)
 
+    def _sample(self, index, *, raw_reward, final_reward, done, trajectory_steps=1):
+        sample = _Sample()
+        sample.index = index
+        sample.group_index = index
+        sample.group_id = index
+        sample.reward = final_reward
+        sample.metadata = {
+            "raw_reward": raw_reward,
+            "final_reward": final_reward,
+            "done": done,
+            "trajectory": [{} for _ in range(trajectory_steps)],
+            "invalid_action_count": 0,
+        }
+        return sample
+
+    def test_webshop_summary_adds_paper_score_and_succ_without_changing_existing_metrics(self):
+        metrics = webshop_generate._webshop_summary_from_samples(
+            [
+                self._sample(0, raw_reward=1.0, final_reward=10.0, done=True),
+                self._sample(1, raw_reward=0.4, final_reward=4.0, done=True),
+                self._sample(2, raw_reward=0.0, final_reward=0.0, done=False),
+            ]
+        )
+
+        self.assertAlmostEqual(metrics["webshop/score"], (1.0 + 0.4 + 0.0) / 3)
+        self.assertAlmostEqual(metrics["webshop/succ"], 1 / 3)
+        self.assertAlmostEqual(metrics["webshop/raw_reward_mean"], metrics["webshop/score"])
+        self.assertAlmostEqual(metrics["webshop/success_rate"], 2 / 3)
+        self.assertAlmostEqual(metrics["webshop/final_reward_mean"], (10.0 + 4.0 + 0.0) / 3)
+
     def test_dense_reward_mode_is_default_and_keeps_partial_reward(self):
         os.environ.pop("WEBSHOP_REWARD_MODE", None)
 

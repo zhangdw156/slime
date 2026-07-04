@@ -84,6 +84,13 @@ Important launcher defaults:
 - eval samples per prompt `1`, temperature `0.4`, top-p `1.0`
 - single eval dataset: `valid.jsonl`
 
+Training and eval logs include WebShop paper-parity metrics from the same episode summary function:
+
+- `webshop/score`: mean raw WebShop task score with partial credit, matching the usual paper `score`/task-score definition before any 0-100 table scaling.
+- `webshop/succ`: harsh full-success rate, counted only when the episode is done and raw task score reaches `1.0`.
+
+Existing metrics are still emitted unchanged, including `webshop/raw_reward_mean`, `webshop/final_reward_mean`, and the legacy partial-positive `webshop/success_rate`. Eval prefixes these as `eval/<dataset_name>/webshop/...`, for example `eval/valid_full/webshop/score` and `eval/valid_full/webshop/succ`.
+
 ## 4. Run full held-out validation only
 
 Use the full-valid eval launcher after training when you want to score a saved checkpoint on all 500 held-out WebShop goals. The launcher writes a separate full-eval task directory and does not overwrite the training-time files under `/root/slime-webshop`.

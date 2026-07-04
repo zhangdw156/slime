@@ -557,20 +557,24 @@ def _webshop_summary_from_samples(samples: list[Sample]) -> dict[str, float]:
 
     raw_rewards = []
     final_rewards = []
+    paper_successes = []
     steps = []
     invalid_counts = []
     done_count = 0
     purchase_count = 0
     for sample in trajectories:
         metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
-        raw_rewards.append(float(metadata.get("raw_reward", sample.reward or 0.0)))
+        raw_reward = float(metadata.get("raw_reward", sample.reward or 0.0))
+        done = bool(metadata.get("done"))
+        raw_rewards.append(raw_reward)
         final_rewards.append(float(metadata.get("final_reward", sample.reward or 0.0)))
         trajectory = metadata.get("trajectory") or []
         steps.append(float(len(trajectory)))
         invalid_counts.append(float(metadata.get("invalid_action_count", 0)))
-        if metadata.get("done"):
+        if done:
             done_count += 1
-        if float(metadata.get("raw_reward", sample.reward or 0.0)) > 0:
+        paper_successes.append(1.0 if done and raw_reward >= 1.0 else 0.0)
+        if raw_reward > 0:
             purchase_count += 1
 
     def mean(values: list[float]) -> float:
@@ -578,6 +582,10 @@ def _webshop_summary_from_samples(samples: list[Sample]) -> dict[str, float]:
 
     return {
         "webshop/episodes": float(len(trajectories)),
+        # Paper-parity WebShop metrics: score is the environment task score
+        # with partial credit; succ is the harsh full-score success rate.
+        "webshop/score": mean(raw_rewards),
+        "webshop/succ": mean(paper_successes),
         "webshop/raw_reward_mean": mean(raw_rewards),
         "webshop/final_reward_mean": mean(final_rewards),
         "webshop/success_rate": mean([1.0 if reward > 0 else 0.0 for reward in raw_rewards]),
