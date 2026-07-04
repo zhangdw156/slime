@@ -131,7 +131,6 @@ if [[ -n "${CKPT_STEP}" ]]; then
 fi
 
 ROLLOUT_ARGS=(
-   --disable-rollout-global-dataset
    --input-key text
    --metadata-key metadata
    --num-rollout 0

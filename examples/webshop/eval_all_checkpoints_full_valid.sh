@@ -581,7 +581,6 @@ run_eval_step() {
   fi
 
   local ROLLOUT_ARGS=(
-    --disable-rollout-global-dataset
     --input-key text
     --metadata-key metadata
     --num-rollout 0
