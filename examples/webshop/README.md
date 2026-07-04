@@ -1,6 +1,6 @@
 # WebShop GRPO example
 
-This example trains `Qwen2.5-3B-Instruct` with slime GRPO against a separately deployed WebShop HTTP service. The defaults target the WebShop small synthetic setup: `env_seed=0`, `max_steps=15`, train pool `goal_idx >= 500`, train-time validation `goal_idx < 100`, full held-out validation `goal_idx < 500`, `train_batch_size=16`, `rollout.n=8`, `val_batch_size=100`, `test_freq=5`, and `total_epochs=150`.
+This example trains `Qwen2.5-3B-Instruct` with slime GRPO against a separately deployed WebShop HTTP service. The defaults target the WebShop small synthetic setup: `env_seed=0`, `max_steps=15`, train pool `goal_idx >= 500`, train-time validation `goal_idx < 100`, full held-out validation `goal_idx < 500`, `rollout_batch_size=16`, `rollout.n=8`, `val_batch_size=100`, `test_freq=5`, and `NUM_ROLLOUT=150` in the launcher.
 
 ## Files
 
@@ -52,13 +52,13 @@ python examples/webshop/prepare_webshop_data.py \
   --output-dir /root/slime-webshop
 ```
 
-This writes the fixed slime WebShop task schedule:
+This writes the fixed slime WebShop task dataset:
 
-- `/root/slime-webshop/train.jsonl` — 150 rollout batches × 16 prompt groups; metadata includes `goal_idx` and worker `goal_seed`.
+- `/root/slime-webshop/train.jsonl` — full small train pool, `goal_idx` 500 through 6909 by default; metadata includes `goal_idx` and `goal_seed`.
 - `/root/slime-webshop/valid.jsonl` — train-time validation batch of 100 prompt groups, `goal_idx` 0 through 99.
 - `/root/slime-webshop/summary.json`.
 
-The generated schedule keeps validation goals from `[0, 100)`, training goals from `[500, goal_count)`, and each prompt group is repeated by `N_SAMPLES_PER_PROMPT=8` during rollout. Goals `[100, 500)` are held out from training-time eval and are included only in the full validation launcher below.
+The generated dataset is independent of training length: validation goals come from `[0, 100)`, training goals come from the full `[500, goal_count)` pool, and each prompt group is repeated by `N_SAMPLES_PER_PROMPT=8` during rollout. Goals `[100, 500)` are held out from training-time eval and are included only in the full validation launcher below. Change `NUM_ROLLOUT` to run more or fewer training steps without regenerating a differently sized training dataset.
 
 ## 3. Launch GRPO
 

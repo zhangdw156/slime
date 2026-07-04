@@ -422,8 +422,6 @@ generate_full_eval_index() {
     --output-dir "${WEBSHOP_FULL_EVAL_TASK_DIR}" \
     --env-seed "${WEBSHOP_ENV_SEED}" \
     --train-start "${WEBSHOP_TRAIN_START}" \
-    --train-batch-size "${ROLLOUT_BATCH_SIZE}" \
-    --total-rollouts 1 \
     --valid-size "${WEBSHOP_FULL_VALID_SIZE}"
   mv -f "${WEBSHOP_FULL_EVAL_TASK_DIR}/valid.jsonl" "${FULL_VALID_DATA}"
 
