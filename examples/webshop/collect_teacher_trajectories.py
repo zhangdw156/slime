@@ -41,7 +41,7 @@ DEFAULT_SAMPLES_PER_TASK = 8
 DEFAULT_HISTORY_LENGTH = 4
 DEFAULT_STEP_MAX_TOKENS = 512
 DEFAULT_MAX_PROMPT_CHARS = 13000
-DEFAULT_INVALID_ACTION_PENALTY = 0.1
+DEFAULT_INVALID_ACTION_PENALTY = 0.01
 DEFAULT_REWARD_MODE = "dense"
 SUPPORTED_REWARD_MODES = {"binary", "dense"}
 DEFAULT_REQUEST_TIMEOUT = 0.0
@@ -233,8 +233,8 @@ def _episode_reward_from_raw(*, raw_reward: float, done: bool, reward_mode: str)
     if not done:
         return 0.0
     if reward_mode == "binary":
-        return 10.0 if raw_reward >= 1.0 else 0.0
-    return 10.0 * max(0.0, min(1.0, float(raw_reward)))
+        return 1.0 if raw_reward >= 1.0 else 0.0
+    return max(0.0, min(1.0, float(raw_reward)))
 
 
 def _normalized_reward_mode(value: str) -> str:

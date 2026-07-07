@@ -78,7 +78,7 @@ Important launcher defaults:
 - `GLOBAL_BATCH_SIZE=128`
 - `NUM_ROLLOUT=150`
 - `EVAL_INTERVAL=5`, with eval before train enabled by slime default
-- rollout internals use `max_steps=15`, `history_length=4` (override with `WEBSHOP_HISTORY_LENGTH`), per-step generation cap `512`, history fallback threshold `13000` chars, invalid-action penalty `0.1` on the invalid step
+- rollout internals use `max_steps=15`, `history_length=4` (override with `WEBSHOP_HISTORY_LENGTH`), per-step generation cap `512`, history fallback threshold `13000` chars, native-scale reward (`dense`: raw score in `0..1`; `binary`: full-success `0/1`), and trajectory-level invalid-action penalty `0.01 * invalid_action_count` before GRPO normalization
 - `MAX_TOKENS_PER_GPU=32768`
 - `LOG_PROBS_CHUNK_SIZE=8192`
 - eval samples per prompt `1`, temperature `0.4`, top-p `1.0`
@@ -89,7 +89,7 @@ Training and eval logs include WebShop paper-parity metrics from the same episod
 - `webshop/score`: mean raw WebShop task score with partial credit, matching the usual paper `score`/task-score definition before any 0-100 table scaling.
 - `webshop/succ`: harsh full-success rate, counted only when the episode is done and raw task score reaches `1.0`.
 
-Existing metrics are still emitted unchanged, including `webshop/raw_reward_mean`, `webshop/final_reward_mean`, and the legacy partial-positive `webshop/success_rate`. Eval prefixes these as `eval/<dataset_name>/webshop/...`, for example `eval/valid_full/webshop/score` and `eval/valid_full/webshop/succ`.
+`webshop/final_reward_mean` is the training reward after reward-mode conversion and invalid-action penalty, while `webshop/raw_reward_mean` remains the raw task score. The legacy `webshop/success_rate` still counts any positive raw score. Eval prefixes these as `eval/<dataset_name>/webshop/...`, for example `eval/valid_full/webshop/score` and `eval/valid_full/webshop/succ`.
 
 ## 4. Run full held-out validation only
 

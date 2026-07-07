@@ -33,7 +33,7 @@ DEFAULT_MAX_STEPS = 15
 DEFAULT_HISTORY_LENGTH = 4
 DEFAULT_STEP_MAX_TOKENS = 512
 DEFAULT_MAX_PROMPT_CHARS = 13000
-DEFAULT_INVALID_ACTION_PENALTY = 0.1
+DEFAULT_INVALID_ACTION_PENALTY = 0.01
 DEFAULT_REWARD_MODE = "dense"
 SUPPORTED_REWARD_MODES = {"binary", "dense"}
 
@@ -163,11 +163,11 @@ def _episode_reward_from_raw(*, raw_reward: float, done: bool, reward_mode: str 
 
     mode = reward_mode or _get_reward_mode()
     if mode == "binary":
-        return 10.0 if raw_reward >= 1.0 else 0.0
+        return 1.0 if raw_reward >= 1.0 else 0.0
 
-    # Dense mode keeps WebShop's partial-match reward signal while preserving
-    # the previous full-success scale of 10.0.
-    return 10.0 * max(0.0, min(1.0, float(raw_reward)))
+    # Dense mode keeps WebShop's partial-match reward on its native 0..1 scale,
+    # matching ALFWorld's success-as-1 reward convention in this example suite.
+    return max(0.0, min(1.0, float(raw_reward)))
 
 
 def _service_action_from_projection(parsed_action: str, projected_action: str) -> str:
@@ -183,10 +183,6 @@ def _service_action_from_projection(parsed_action: str, projected_action: str) -
     if parsed_action.startswith(("search[", "click[")):
         return parsed_action
     return projected_action
-
-
-def _step_reward(*, episode_reward: float, valid_action: bool, invalid_action_penalty: float) -> float:
-    return episode_reward - (0.0 if valid_action else invalid_action_penalty)
 
 
 def _router_headers(args: Namespace, sample: Sample) -> dict[str, str] | None:
@@ -428,11 +424,7 @@ async def generate(
         step_record = step_sample.metadata["webshop_step"]
         valid_action = bool(step_record.get("valid_action"))
         step_penalty = 0.0 if valid_action else invalid_action_penalty
-        step_sample.reward = _step_reward(
-            episode_reward=episode_reward,
-            valid_action=valid_action,
-            invalid_action_penalty=invalid_action_penalty,
-        )
+        step_sample.reward = final_reward
         step_sample.metadata = {
             **episode_metadata,
             "episode_id": trajectory_id,
@@ -462,7 +454,7 @@ def check_episode_reward_nonzero_std(args, samples: list[Sample] | list[list[Sam
 
     ``generate`` returns one list of step samples per trajectory.  The default
     reward-std filter would see repeated step rewards from the same trajectory;
-    for GRPO we need to compare the trajectory-level rewards among the
+    for GRPO we need to compare the final trajectory rewards among the
     ``n_samples_per_prompt`` siblings for the same prompt.
     """
 
@@ -471,7 +463,7 @@ def check_episode_reward_nonzero_std(args, samples: list[Sample] | list[list[Sam
         if not trajectory_samples:
             continue
         metadata = trajectory_samples[0].metadata if isinstance(trajectory_samples[0].metadata, dict) else {}
-        rewards.append(float(metadata.get("episode_reward", trajectory_samples[0].get_reward_value(args))))
+        rewards.append(float(metadata.get("final_reward", trajectory_samples[0].get_reward_value(args))))
 
     if len(rewards) <= 1:
         return DynamicFilterOutput(keep=True)
@@ -489,11 +481,13 @@ def check_episode_reward_nonzero_std(args, samples: list[Sample] | list[list[Sam
 def grpo_normalize_webshop_steps(args, samples: list[Sample]) -> tuple[list[float], list[float]]:
     """Normalize GRPO rewards by trajectory and broadcast to step samples.
 
-    All step samples from one WebShop episode share ``group_id`` and the final
-    episode reward.  Normalize one reward per trajectory inside each original
+    All step samples from one WebShop episode share ``group_id`` and the same
+    final reward: native-scale episode reward minus the trajectory-level invalid
+    action penalty.  Normalize one reward per trajectory inside each original
     prompt group, then assign that normalized value back to every step from the
-    same trajectory.  This prevents longer WebShop episodes from receiving more
-    total advantage mass only because they produced more step samples.
+    same trajectory.  This mirrors the ALFWorld example and prevents longer
+    WebShop episodes from receiving more total advantage mass only because they
+    produced more step samples.
     """
 
     raw_rewards = [sample.get_reward_value(args) for sample in samples]
@@ -506,15 +500,14 @@ def grpo_normalize_webshop_steps(args, samples: list[Sample]) -> tuple[list[floa
     import torch
 
     prompt_groups: dict[int, dict[int, float]] = defaultdict(dict)
-    sample_keys: list[tuple[int, int, float]] = []
+    sample_keys: list[tuple[int, int]] = []
     for sample, reward in zip(samples, raw_rewards, strict=True):
         prompt_key = sample.group_index if sample.group_index is not None else sample.index
         traj_key = sample.group_id if sample.group_id is not None else sample.index
         metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
-        step_penalty = float(metadata.get("step_invalid_action_penalty", 0.0))
-        episode_reward = float(metadata.get("episode_reward", float(reward) + step_penalty))
-        prompt_groups[prompt_key][traj_key] = episode_reward
-        sample_keys.append((prompt_key, traj_key, step_penalty))
+        final_reward = float(metadata.get("final_reward", reward))
+        prompt_groups[prompt_key][traj_key] = final_reward
+        sample_keys.append((prompt_key, traj_key))
 
     normalized_by_traj: dict[tuple[int, int], float] = {}
     use_std = getattr(args, "advantage_estimator", None) in ["grpo", "gspo"] and getattr(
@@ -529,7 +522,7 @@ def grpo_normalize_webshop_steps(args, samples: list[Sample]) -> tuple[list[floa
         for traj_id, value in zip(traj_ids, normalized.tolist(), strict=True):
             normalized_by_traj[(prompt_key, traj_id)] = float(value)
 
-    processed = [normalized_by_traj[(prompt_key, traj_key)] - step_penalty for prompt_key, traj_key, step_penalty in sample_keys]
+    processed = [normalized_by_traj[key] for key in sample_keys]
     return raw_rewards, processed
 
 
