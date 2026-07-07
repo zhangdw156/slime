@@ -5,7 +5,7 @@ These examples provide concrete examples to leverage slime in your own RL workfl
 ## Directory Structure
 
 - **[eval_multi_task](./eval_multi_task)**: Example for supporting evaluation multiple tasks with different configs.
-- **[alfworld](./alfworld)**: Training Qwen2.5-3B-Instruct with GRPO, GRPO+OPSD, or pure OPSD (`--opd-type self`) in the ALFWorld TextWorld environment.
+- **[alfworld](./alfworld)**: Training Qwen2.5-3B-Instruct with GRPO, GRPO+OPSD, or pure OPSD (`--opd-type zopd`) in the ALFWorld TextWorld environment.
 - **[fully_async](./fully_async)**: Demonstrates fully asynchronous rollout generation for higher efficiency.
 - **[geo3k_vlm](./geo3k_vlm)**: Training VLMs on a single-turn reasoning task using GRPO on the GEO3K dataset.
 - **[geo3k_vlm_multi_turn](./geo3k_vlm_multi_turn)**: VLM multi-turn training on Geo3k dataset.

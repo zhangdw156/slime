@@ -1,8 +1,8 @@
 # ALFWorld GRPO / GRPO+OPSD / OPSD / SFT Distillation
 
-This example trains `Qwen2.5-3B-Instruct` with slime GRPO in the ALFWorld TextWorld environment, and can optionally add OPSD-style privileged teacher scoring on top of slime's native OPD advantage penalty. It also includes a pure OPSD launcher that zeros processed task rewards while keeping raw ALFWorld rewards for metrics, plus a `Qwen2.5-0.5B-Instruct` SFT launcher for distilling successful 3B teacher trajectories into a smaller student. It uses `--rollout-function-path batched_rollout.generate_rollout` so one rollout batch can coordinate many active agent-environment episodes: model action requests are issued concurrently per environment step, and ALFWorld environment state is kept in Ray actors.
+This example trains `Qwen2.5-3B-Instruct` with slime GRPO in the ALFWorld TextWorld environment, and can optionally add OPSD-style privileged teacher scoring on top of slime's OPD advantage penalty. It also includes a pure OPSD launcher that zeros processed task rewards while keeping raw ALFWorld rewards for metrics, plus a `Qwen2.5-0.5B-Instruct` SFT launcher for distilling successful 3B teacher trajectories into a smaller student. It uses `--rollout-function-path batched_rollout.generate_rollout` so one rollout batch can coordinate many active agent-environment episodes: model action requests are issued concurrently per environment step, and ALFWorld environment state is kept in Ray actors.
 
-The GRPO script is intended to reproduce the ALFWorld GRPO experiment from the SDAR paper [Self-Distilled Agentic Reinforcement Learning](https://arxiv.org/abs/2605.15155) by Meituan and Zhejiang University. The GRPO+OPSD script keeps the same ALFWorld rollout and reward path, but when `--use-opd --opd-type self` is enabled it scores each student step response under SDAR-style privileged ALFWorld skills on the current rollout SGLang router and passes `teacher_log_probs` to slime's existing OPD machinery. The pure OPSD script uses the same teacher-logprob path but sets processed training rewards to `0.0`, so the OPD term is the policy signal.
+The GRPO script is intended to reproduce the ALFWorld GRPO experiment from the SDAR paper [Self-Distilled Agentic Reinforcement Learning](https://arxiv.org/abs/2605.15155) by Meituan and Zhejiang University. The GRPO+OPSD script keeps the same ALFWorld rollout and reward path, but when `--use-opd --opd-type zopd` is enabled it scores each student step response under SDAR-style privileged ALFWorld skills on the current rollout SGLang router and passes `teacher_log_probs` to slime's existing OPD machinery. The pure OPSD script uses the same teacher-logprob path but sets processed training rewards to `0.0`, so the OPD term is the policy signal.
 
 Unless a launcher or experiment note explicitly marks an ablation/comparison setting, every experiment under `examples/alfworld` uses `ALFWORLD_HISTORY_LENGTH=4` by default. Keep `ALFWORLD_HISTORY_LENGTH=4` for standard training, SFT, OPD/OPSD, and evaluation runs; use another value only for intentionally named history-length ablations.
 
@@ -105,7 +105,7 @@ cd /root/slime
 bash examples/alfworld/run_qwen2.5_3B_instruct_opsd.sh
 ```
 
-Both OPSD launchers default to `OPSD_TYPE=self` and `ALFWORLD_OPSD_SKILLS_DIR=examples/alfworld/skills`. In `self` mode they use the current rollout SGLang router as the teacher scorer with `max_new_tokens=0`, so no `--rm-url` or separately deployed teacher is required. To compare against an external SGLang teacher, set `OPSD_TYPE=sglang` and `ALFWORLD_OPSD_TEACHER_URL=http://teacher-host:port/generate`. The pure OPSD launcher does not enable `--use-kl-loss`, so it avoids an extra reference KL path.
+Both OPSD launchers default to `OPSD_TYPE=zopd`, `ALFWORLD_OPD_TEACHER_CONTEXT=privileged`, and `ALFWORLD_OPSD_SKILLS_DIR=examples/alfworld/skills`. In this mode the custom rollout path uses the current rollout SGLang router as the teacher scorer with `max_new_tokens=0`, so no `--rm-url` or separately deployed teacher is required. To compare against an external SGLang teacher, keep `OPSD_TYPE=zopd` and set `ALFWORLD_OPD_TEACHER_SOURCE=external` plus `ALFWORLD_OPD_TEACHER_URL=http://teacher-host:port/generate`. The pure OPSD launcher does not enable `--use-kl-loss`, so it avoids an extra reference KL path.
 
 ## 5. Build 3B teacher SFT data and train a 0.5B student
 
@@ -181,10 +181,10 @@ skips SGLang rollout initialization. With `USE_EVAL=1`, the script evaluates the
 student on `valid_seen` and `valid_unseen` using the same `batched_rollout.py`
 path as the 3B GRPO launcher.
 
-### Native OPD: train a 0.5B student from a trained 3B teacher
+### zOPD with a normal teacher context: train a 0.5B student from a trained 3B teacher
 
-If you want slime's framework-native OPD path instead of the ALFWorld
-privileged-skill OPSD prompt, first deploy the trained 3B teacher as an SGLang
+If you want OPD teacher scoring without the ALFWorld
+privileged-skill teacher context, first deploy the trained 3B teacher as an SGLang
 `/generate` endpoint, then launch the 0.5B student script with `TEACHER_URL`
 pointing to that endpoint:
 
@@ -199,15 +199,15 @@ bash examples/alfworld/run_qwen2.5_0.5B_instruct_opd_from_3B.sh
 ```
 
 Override `TEACHER_URL`, `MODEL_ROOT`, or `MCORE_CKPT` only when your paths or
-teacher endpoint differ from the script defaults. The native OPD launcher
+teacher endpoint differ from the script defaults. The zOPD launcher
 defaults to one rollout per prompt (`N_SAMPLES_PER_PROMPT=1`); increase it only
 if you want multiple student trajectories per ALFWorld task. This launcher sets
-`ALFWORLD_OPD_USE_NATIVE=1`, uses
-`--use-opd --opd-type sglang --rm-url "$TEACHER_URL"`, and reuses
+`ALFWORLD_OPD_TEACHER_CONTEXT=normal`, uses
+`--use-opd --opd-type zopd --rm-url "$TEACHER_URL"`, and reuses
 `slime.rollout.on_policy_distillation.reward_func` to score the 0.5B
 student's online ALFWorld action tokens under the 3B teacher. It keeps raw
 ALFWorld rewards for metrics but returns zero processed training rewards, so
-the policy signal is the native OPD term. Unlike the `_opsd.sh` launchers, this
+the policy signal is the OPD term. Unlike the `_opsd.sh` launchers, this
 path does not prepend ALFWorld privileged skill text to the teacher prompt.
 
 
@@ -226,10 +226,10 @@ be overridden with environment variables shown above.
 | `collect_teacher_trajectories.py` | `python examples/alfworld/collect_teacher_trajectories.py --teacher-url http://127.0.0.1:30000/generate --tokenizer-path /root/Qwen2.5-3B-Instruct --task-file /root/slime-alfworld/train_games.jsonl --output-dir /root/slime-alfworld-teacher-sft --resume` | running 3B teacher SGLang `/generate` endpoint and prepared train index | realtime `all_trajectories.jsonl` |
 | `build_sft_from_teacher_trajectories.py` | `python examples/alfworld/build_sft_from_teacher_trajectories.py --input /root/slime-alfworld-teacher-sft/all_trajectories.jsonl --output /root/slime-alfworld-teacher-sft/alfworld_teacher_sft.jsonl` | collected teacher trajectories | messages-format SFT JSONL |
 | `run_qwen2.5_0.5B_instruct_sft.sh` | `bash examples/alfworld/run_qwen2.5_0.5B_instruct_sft.sh` | 0.5B HF + torch_dist checkpoints and SFT JSONL | SFT student checkpoint; optional ALFWorld eval when `USE_EVAL=1` |
-| `run_qwen2.5_0.5B_instruct_opd_from_3B.sh` | `bash examples/alfworld/run_qwen2.5_0.5B_instruct_opd_from_3B.sh` | 0.5B HF + torch_dist checkpoints, prepared game indices, trained 3B SGLang `/generate` endpoint | Native slime OPD training of the 0.5B student from the 3B teacher |
+| `run_qwen2.5_0.5B_instruct_opd_from_3B.sh` | `bash examples/alfworld/run_qwen2.5_0.5B_instruct_opd_from_3B.sh` | 0.5B HF + torch_dist checkpoints, prepared game indices, trained 3B SGLang `/generate` endpoint | zOPD training of the 0.5B student from the 3B teacher |
 
 The remaining Python files in this directory (`batched_rollout.py`,
-`generate_with_alfworld.py`, `opsd.py`, `alfworld_env.py`, and `prompts.py`) are
+`generate_with_alfworld.py`, `zopd.py`, `alfworld_env.py`, and `prompts.py`) are
 imported by the entrypoints above rather than launched directly.
 
 ## How the example works
@@ -240,10 +240,10 @@ imported by the entrypoints above rather than launched directly.
 - `collect_teacher_trajectories.py` samples actions from a running 3B teacher endpoint, defaults to 8 attempts per ALFWorld task, and records every success/failure/truncation/abort/error trajectory in realtime for offline analysis and distillation.
 - `build_sft_from_teacher_trajectories.py` selects the shortest successful trajectory for each task from the collected attempts and writes messages-format SFT rows consumed by the 0.5B SFT launcher.
 - `run_qwen2.5_0.5B_instruct_sft.sh` uses `slime.rollout.sft_rollout.generate_rollout` with `--loss-type sft_loss`; when `USE_EVAL=1`, it separately uses `batched_rollout.generate_rollout` for ALFWorld eval.
-- `opsd.py` mirrors SDAR's ALFWorld privileged skill selection and scores fixed student responses to populate `Sample.teacher_log_probs` when slime OPD is enabled. The default `--opd-type self` path scores on the current rollout router; `OPSD_TYPE=sglang` can point to an external teacher through `ALFWORLD_OPSD_TEACHER_URL`.
+- `zopd.py` owns ALFWorld custom OPD teacher scoring. With `ALFWORLD_OPD_TEACHER_CONTEXT=privileged`, it mirrors SDAR's privileged skill selection and scores fixed student responses on the current rollout router by default. With `ALFWORLD_OPD_TEACHER_CONTEXT=normal`, it scores the original prompt/action tokens, typically against an external teacher endpoint.
 - The reward is `1 * won - ALFWORLD_INVALID_ACTION_PENALTY * invalid_action_count`; the default invalid-action penalty is `0.01`.
 - `loss_mask` is `1` only on assistant-generated tokens and `0` on environment/user-observation tokens.
-- Without `--use-opd`, the training objective is plain GRPO. With `--use-opd --opd-type self`, the rollout also fills `teacher_log_probs` from privileged prompts and slime applies its native OPD advantage penalty. The pure OPSD launcher uses `generate_with_alfworld.zero_alfworld_rewards_for_opsd` to keep `raw_reward` metrics while returning zero processed rewards for training.
+- Without `--use-opd`, the training objective is plain GRPO. With `--use-opd --opd-type zopd`, the rollout also fills `teacher_log_probs` from privileged prompts and slime applies its OPD advantage penalty. The pure OPSD launcher uses `generate_with_alfworld.zero_alfworld_rewards_for_opsd` to keep `raw_reward` metrics while returning zero processed rewards for training.
 
 ## File map
 
@@ -253,11 +253,11 @@ imported by the entrypoints above rather than launched directly.
 | `run_qwen2.5_3B_instruct_grpo_opsd.sh` | GRPO launcher with OPSD teacher-logprob scoring enabled via slime OPD |
 | `run_qwen2.5_3B_instruct_opsd.sh` | pure OPSD launcher with zero processed rewards and no GRPO reward-std filter |
 | `run_qwen2.5_0.5B_instruct_sft.sh` | SFT launcher for distilling 3B teacher ALFWorld data into Qwen2.5-0.5B-Instruct |
-| `run_qwen2.5_0.5B_instruct_opd_from_3B.sh` | native slime OPD launcher for online ALFWorld 0.5B rollouts scored by a trained 3B SGLang teacher |
+| `run_qwen2.5_0.5B_instruct_opd_from_3B.sh` | zOPD launcher for online ALFWorld 0.5B rollouts scored by a trained 3B SGLang teacher without privileged context |
 | `collect_teacher_trajectories.py` | collects all teacher trajectory attempts from a running 3B teacher endpoint |
 | `build_sft_from_teacher_trajectories.py` | filters successful teacher trajectories into messages-format SFT data |
 | `batched_rollout.py` | custom batched ALFWorld rollout function used by `--rollout-function-path` |
-| `opsd.py` | SDAR-style privileged skill loading and teacher log-prob scoring helpers |
+| `zopd.py` | ALFWorld zOPD helpers for normal and privileged teacher-logprob scoring |
 | `skills/` | ALFWorld privileged skill mapping and markdown copied from SDAR runtime skills |
 | `generate_with_alfworld.py` | single-episode fallback plus reward/filter/helper functions |
 | `alfworld_env.py` | lazy ALFWorld TextWorld episode wrapper |

@@ -1,9 +1,9 @@
 #!/bin/bash
 
-# Docker-friendly ALFWorld native-OPD launcher for Qwen2.5-0.5B-Instruct.
+# Docker-friendly ALFWorld zOPD launcher for Qwen2.5-0.5B-Instruct.
 # The 0.5B student performs online ALFWorld rollouts. A trained 3B SGLang
-# teacher endpoint scores the student's generated action tokens through slime's
-# framework-native OPD helper; ALFWorld environment rewards are kept for metrics
+# teacher endpoint scores the student's generated action tokens through the
+# ALFWorld custom OPD hook; ALFWorld environment rewards are kept for metrics
 # while processed training rewards are zeroed so OPD is the policy signal.
 
 # Optional destructive cleanup for dedicated containers only. It is disabled by
@@ -40,7 +40,7 @@ source "${SCRIPT_DIR}/../../scripts/models/qwen2.5-0.5B.sh"
 
 MODEL_ROOT=${MODEL_ROOT:-/root/Qwen2.5-0.5B-Instruct}
 MCORE_CKPT=${MCORE_CKPT:-/root/Qwen2.5-0.5B-Instruct_torch_dist}
-SLIME_CKPT=${SLIME_CKPT:-/root/Qwen2.5-0.5B-Instruct_alfworld_native_opd_from_3B_slime}
+SLIME_CKPT=${SLIME_CKPT:-/root/Qwen2.5-0.5B-Instruct_alfworld_zopd_from_3B_slime}
 ALFWORLD_TASK_DIR=${ALFWORLD_TASK_DIR:-/root/slime-alfworld}
 export ALFWORLD_DATA=${ALFWORLD_DATA:-/root/.cache/alfworld}
 export ALFWORLD_CONFIG_PATH=${ALFWORLD_CONFIG_PATH:-${SCRIPT_DIR}/configs/config_tw.yaml}
@@ -50,10 +50,12 @@ export ALFWORLD_STEP_MAX_TOKENS=${ALFWORLD_STEP_MAX_TOKENS:-512}
 export ALFWORLD_INVALID_ACTION_PENALTY=${ALFWORLD_INVALID_ACTION_PENALTY:-0.01}
 export ALFWORLD_ENV_WORKER_CPUS=${ALFWORLD_ENV_WORKER_CPUS:-0.1}
 export ALFWORLD_ENV_WORKER_MAX_EPISODES=${ALFWORLD_ENV_WORKER_MAX_EPISODES:-1}
-# Route ALFWorld's custom rollout OPD annotation through slime's native
-# on_policy_distillation.reward_func instead of the ALFWorld privileged-skill OPSD prompt.
-export ALFWORLD_OPD_USE_NATIVE=1
-export ALFWORLD_NATIVE_OPD_TEACHER_CONCURRENCY=${ALFWORLD_NATIVE_OPD_TEACHER_CONCURRENCY:-64}
+# zOPD = custom rollout-provided OPD teacher log-probs.  This launcher uses
+# a normal teacher context: score the student's original ALFWorld prompt/action
+# tokens without the privileged-skill prompt used by the OPSD launchers.
+export ALFWORLD_OPD_TEACHER_CONTEXT=${ALFWORLD_OPD_TEACHER_CONTEXT:-normal}
+export ALFWORLD_OPD_TEACHER_SOURCE=${ALFWORLD_OPD_TEACHER_SOURCE:-external}
+export ALFWORLD_OPD_TEACHER_CONCURRENCY=${ALFWORLD_OPD_TEACHER_CONCURRENCY:-64}
 
 # Point this at the trained 3B teacher SGLang /generate endpoint. The script
 # does not launch or kill the teacher by default, so it is safe on shared nodes.
@@ -139,7 +141,7 @@ OPD_ARGS=(
    --eps-clip 0.2
    --eps-clip-high 0.28
    --use-opd
-   --opd-type sglang
+   --opd-type zopd
    --opd-kl-coef "${OPD_KL_COEF}"
    --rm-url "${TEACHER_URL}"
 )
@@ -156,7 +158,7 @@ OPTIMIZER_ARGS=(
 WANDB_ARGS=(
    # --use-wandb
    # --wandb-project slime-alfworld
-   # --wandb-group qwen2.5-0.5B-instruct-native-opd
+   # --wandb-group qwen2.5-0.5B-instruct-zopd
    # --wandb-key ${WANDB_KEY}
 )
 
@@ -166,8 +168,8 @@ if [[ "${USE_SWANLAB:-1}" == "1" ]]; then
       --use-swanlab
       --swanlab-mode "${SWANLAB_MODE:-cloud}"
       --swanlab-project "${SWANLAB_PROJECT:-slime-alfworld}"
-      --swanlab-group "${SWANLAB_GROUP:-qwen2.5-0.5B-instruct-native-opd}"
-      --swanlab-experiment-name "${SWANLAB_EXPERIMENT_NAME:-qwen2.5-0.5B-instruct-alfworld-native-opd-from-3B}"
+      --swanlab-group "${SWANLAB_GROUP:-qwen2.5-0.5B-instruct-zopd}"
+      --swanlab-experiment-name "${SWANLAB_EXPERIMENT_NAME:-qwen2.5-0.5B-instruct-alfworld-zopd-from-3B}"
       --disable-swanlab-random-suffix
    )
    if [[ -n "${SWANLAB_API_KEY:-}" ]]; then
@@ -227,8 +229,9 @@ RUNTIME_ENV_JSON="{
     \"ALFWORLD_INVALID_ACTION_PENALTY\": \"${ALFWORLD_INVALID_ACTION_PENALTY}\",
     \"ALFWORLD_ENV_WORKER_CPUS\": \"${ALFWORLD_ENV_WORKER_CPUS}\",
     \"ALFWORLD_ENV_WORKER_MAX_EPISODES\": \"${ALFWORLD_ENV_WORKER_MAX_EPISODES}\",
-    \"ALFWORLD_OPD_USE_NATIVE\": \"${ALFWORLD_OPD_USE_NATIVE}\",
-    \"ALFWORLD_NATIVE_OPD_TEACHER_CONCURRENCY\": \"${ALFWORLD_NATIVE_OPD_TEACHER_CONCURRENCY}\",
+    \"ALFWORLD_OPD_TEACHER_CONTEXT\": \"${ALFWORLD_OPD_TEACHER_CONTEXT}\",
+    \"ALFWORLD_OPD_TEACHER_SOURCE\": \"${ALFWORLD_OPD_TEACHER_SOURCE}\",
+    \"ALFWORLD_OPD_TEACHER_CONCURRENCY\": \"${ALFWORLD_OPD_TEACHER_CONCURRENCY}\",
     \"ALFWORLD_OPD_TEACHER_URL\": \"${ALFWORLD_OPD_TEACHER_URL}\"
   }
 }"

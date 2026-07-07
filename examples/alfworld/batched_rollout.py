@@ -41,7 +41,7 @@ from generate_with_alfworld import (
     _router_headers,
     _safe_action_for_env,
 )
-from opsd import annotate_opsd_teacher_log_probs, ensure_opsd_teacher_log_probs, opsd_enabled
+from zopd import annotate_zopd_teacher_log_probs, ensure_zopd_teacher_log_probs, zopd_enabled
 from prompts import _task_description_from_reset, parse_action
 
 from slime.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput
@@ -414,7 +414,7 @@ def _finalize_trajectory(
     if not trajectory.step_samples:
         reason = "sglang_abort" if trajectory.aborted else "empty_episode_response"
         placeholder = _make_placeholder_step_sample(trajectory.sample, generate_state.tokenizer, episode_metadata, reason)
-        ensure_opsd_teacher_log_probs(args, [placeholder])
+        ensure_zopd_teacher_log_probs(args, [placeholder])
         return [placeholder]
 
     if any(step_sample.rollout_log_probs is None for step_sample in trajectory.step_samples):
@@ -430,7 +430,7 @@ def _finalize_trajectory(
             "alfworld_step": step_sample.metadata["alfworld_step"],
         }
 
-    ensure_opsd_teacher_log_probs(args, trajectory.step_samples)
+    ensure_zopd_teacher_log_probs(args, trajectory.step_samples)
 
     return trajectory.step_samples
 
@@ -538,8 +538,8 @@ async def _run_batched_episodes(
                 if step_sample is not None:
                     step_samples.append(step_sample)
 
-            if not evaluation and step_samples and opsd_enabled(args):
-                await annotate_opsd_teacher_log_probs(args, generate_state.tokenizer, step_samples)
+            if not evaluation and step_samples and zopd_enabled(args):
+                await annotate_zopd_teacher_log_probs(args, generate_state.tokenizer, step_samples)
 
         return [
             _finalize_trajectory(args, generate_state, trajectory, invalid_action_penalty)

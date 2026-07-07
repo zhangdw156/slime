@@ -18,7 +18,7 @@ from collections import defaultdict
 from typing import Any
 
 from alfworld_env import AlfWorldTextEpisode
-from opsd import annotate_opsd_teacher_log_probs, ensure_opsd_teacher_log_probs, opsd_enabled
+from zopd import annotate_zopd_teacher_log_probs, ensure_zopd_teacher_log_probs, zopd_enabled
 from prompts import ALFWORLD_SYSTEM_PROMPT, _task_description_from_reset, build_observation_prompt, parse_action
 
 from slime.rollout.filter_hub.base_types import DynamicFilterOutput
@@ -343,8 +343,8 @@ async def generate(
                     "alfworld_step": step_record,
                 }
                 step_samples.append(step_sample)
-                if not evaluation and opsd_enabled(args):
-                    await annotate_opsd_teacher_log_probs(args, tokenizer, [step_sample])
+                if not evaluation and zopd_enabled(args):
+                    await annotate_zopd_teacher_log_probs(args, tokenizer, [step_sample])
 
             if done:
                 break
@@ -377,7 +377,7 @@ async def generate(
     if not step_samples:
         reason = "sglang_abort" if aborted else "empty_episode_response"
         placeholder = _make_placeholder_step_sample(sample, tokenizer, episode_metadata, reason)
-        ensure_opsd_teacher_log_probs(args, [placeholder])
+        ensure_zopd_teacher_log_probs(args, [placeholder])
         return [placeholder]
 
     # Keep the rollout-logprob field all-or-nothing.  The train-data converter
@@ -396,7 +396,7 @@ async def generate(
             "alfworld_step": step_sample.metadata["alfworld_step"],
         }
 
-    ensure_opsd_teacher_log_probs(args, step_samples)
+    ensure_zopd_teacher_log_probs(args, step_samples)
 
     return step_samples
 

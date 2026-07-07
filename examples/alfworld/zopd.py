@@ -1,18 +1,18 @@
-"""OPSD helpers for ALFWorld privileged-teacher log-prob scoring.
+"""Custom OPD helpers for ALFWorld rollout-provided teacher log-probs.
 
-The helper mirrors the SDAR ALFWorld skill prompt construction: pick
-privileged skill text from ``skill_mapping.json``, prepend it under the
-``[Privileged Skill Information]`` header, then score the student response under
-that teacher-conditioned prompt.  The resulting response-token log-probs are
-stored on ``Sample.teacher_log_probs`` so slime's native ``--use-opd`` advantage
-penalty can consume them.  ALFWorld's default OPSD path uses
-``--opd-type self``: the current rollout SGLang router scores the fixed student
-response under the privileged prompt with ``max_new_tokens=0``.
+``zopd`` is the ALFWorld/custom-rollout OPD mode: rollout code owns how
+teacher log-probs are produced, and slime's core OPD loss only consumes
+``Sample.teacher_log_probs``.  This keeps the OPD mechanism separate from the
+teacher context.  ALFWorld currently uses two teacher contexts:
+
+- ``normal``: score the student's original ALFWorld prompt/action tokens.
+- ``privileged``: prepend SDAR-style privileged skill text before scoring.
 """
 
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 import os
@@ -20,7 +20,6 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-from native_opd import annotate_native_opd_teacher_log_probs, native_opd_enabled
 from slime.utils.http_utils import post
 from slime.utils.types import Sample
 
@@ -28,6 +27,8 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_SKILLS_DIR = Path(__file__).resolve().parent / "skills"
 DEFAULT_TEACHER_CONCURRENCY = 64
+NORMAL_TEACHER_CONTEXT = "normal"
+PRIVILEGED_TEACHER_CONTEXT = "privileged"
 
 
 def _str_to_bool(value: str | None, default: bool = False) -> bool:
@@ -42,6 +43,25 @@ def _get_int_env(name: str, default: int) -> int:
     except ValueError:
         logger.warning("Invalid integer for %s=%r; using %s", name, os.environ.get(name), default)
         return default
+
+
+def zopd_enabled(args: Any) -> bool:
+    """Return whether ALFWorld rollout should provide custom OPD log-probs."""
+    return bool(getattr(args, "use_opd", False) and getattr(args, "opd_type", None) == "zopd")
+
+
+def zopd_teacher_context(default: str = PRIVILEGED_TEACHER_CONTEXT) -> str:
+    """Return the teacher context requested by ALFWorld launchers."""
+    value = os.environ.get("ALFWORLD_OPD_TEACHER_CONTEXT")
+    if not value:
+        return default
+    value = value.strip().lower()
+    if value not in {NORMAL_TEACHER_CONTEXT, PRIVILEGED_TEACHER_CONTEXT}:
+        raise ValueError(
+            "ALFWORLD_OPD_TEACHER_CONTEXT must be 'normal' or 'privileged', "
+            f"got {value!r}."
+        )
+    return value
 
 
 class SkillProvider:
@@ -119,11 +139,7 @@ class SkillProvider:
         return "\n\n".join(parts)
 
     def get_privileged_info_from_data_source(self, data_source: str, prompt_text: str) -> str:
-        """Keep SDAR's lookup priority while falling back to prompt matching.
-
-        ALFWorld rows normally carry ``metadata.gamefile``.  This method exists
-        for compatibility with SDAR's teacher-batch construction order.
-        """
+        """Keep SDAR's lookup priority while falling back to prompt matching."""
         if self.skill_all:
             return self._all_skills_text
         if data_source:
@@ -144,21 +160,20 @@ def get_skill_provider() -> SkillProvider:
     return _cached_provider(str(Path(skills_dir).expanduser().resolve()), skill_all)
 
 
-def opsd_enabled(args: Any) -> bool:
-    return bool(getattr(args, "use_opd", False) and getattr(args, "opd_type", None) in {"self", "sglang"})
-
-
 def _current_rollout_router_url(args: Any) -> str:
     return f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
 
 
 def _teacher_url(args: Any) -> str:
-    if getattr(args, "opd_type", None) == "self":
-        return _current_rollout_router_url(args)
+    explicit_url = os.environ.get("ALFWORLD_OPD_TEACHER_URL") or os.environ.get("ALFWORLD_OPSD_TEACHER_URL") or getattr(args, "rm_url", None)
+    teacher_source = (os.environ.get("ALFWORLD_OPD_TEACHER_SOURCE") or "").strip().lower()
 
-    explicit_url = os.environ.get("ALFWORLD_OPSD_TEACHER_URL") or getattr(args, "rm_url", None)
-    if explicit_url:
-        return explicit_url
+    if teacher_source == "external":
+        if explicit_url:
+            return explicit_url
+        raise ValueError("ALFWORLD_OPD_TEACHER_SOURCE=external requires ALFWORLD_OPD_TEACHER_URL or --rm-url.")
+    if teacher_source not in {"", "rollout"}:
+        raise ValueError("ALFWORLD_OPD_TEACHER_SOURCE must be empty, 'rollout', or 'external'.")
     return _current_rollout_router_url(args)
 
 
@@ -209,7 +224,7 @@ def build_privileged_teacher_prompt(sample: Sample, provider: SkillProvider | No
 
 def _extract_response_log_probs(payload: dict[str, Any], response_length: int) -> list[float]:
     token_logprobs = payload.get("meta_info", {}).get("input_token_logprobs") or []
-    # SGLang reports a placeholder/None log-prob for the first input token.  Match
+    # SGLang reports a placeholder/None log-prob for the first input token. Match
     # slime's generic OPD helper by dropping that element before slicing the
     # generated response suffix.
     values = [item[0] for item in token_logprobs[1:]]
@@ -223,7 +238,32 @@ def _extract_response_log_probs(payload: dict[str, Any], response_length: int) -
     return [float(value) for value in response_log_probs]
 
 
-async def score_sample_teacher_log_probs(
+async def annotate_normal_teacher_log_probs(args: Any, samples: list[Sample]) -> None:
+    """Populate ``teacher_log_probs`` with a normal, non-privileged teacher."""
+    if not samples:
+        return
+
+    from slime.rollout.on_policy_distillation import post_process_rewards, reward_func
+
+    concurrency = max(1, _get_int_env("ALFWORLD_OPD_TEACHER_CONCURRENCY", DEFAULT_TEACHER_CONCURRENCY))
+    semaphore = asyncio.Semaphore(concurrency)
+
+    async def _score(sample: Sample) -> Any:
+        async with semaphore:
+            return await reward_func(args, sample)
+
+    original_rewards = [copy.deepcopy(sample.reward) for sample in samples]
+    teacher_payloads = await asyncio.gather(*[_score(sample) for sample in samples])
+    try:
+        for sample, payload in zip(samples, teacher_payloads, strict=True):
+            sample.reward = payload
+        post_process_rewards(args, samples)
+    finally:
+        for sample, reward in zip(samples, original_rewards, strict=True):
+            sample.reward = reward
+
+
+async def _score_privileged_teacher_log_probs(
     args: Any, tokenizer: Any, sample: Sample, provider: SkillProvider
 ) -> list[float]:
     teacher_prompt = build_privileged_teacher_prompt(sample, provider)
@@ -247,31 +287,36 @@ async def score_sample_teacher_log_probs(
     return _extract_response_log_probs(output, sample.response_length)
 
 
-async def annotate_opsd_teacher_log_probs(args: Any, tokenizer: Any, samples: list[Sample]) -> None:
-    """Populate ``Sample.teacher_log_probs`` for ALFWorld OPD/OPSD train samples."""
-    if not opsd_enabled(args) or not samples:
-        return
-
-    if native_opd_enabled(args):
-        await annotate_native_opd_teacher_log_probs(args, samples)
-        return
-
+async def annotate_privileged_teacher_log_probs(args: Any, tokenizer: Any, samples: list[Sample]) -> None:
+    """Populate ``teacher_log_probs`` with ALFWorld privileged teacher context."""
     provider = get_skill_provider()
     concurrency = max(1, _get_int_env("ALFWORLD_OPSD_TEACHER_CONCURRENCY", DEFAULT_TEACHER_CONCURRENCY))
     semaphore = asyncio.Semaphore(concurrency)
 
     async def _score(sample: Sample) -> list[float]:
         async with semaphore:
-            return await score_sample_teacher_log_probs(args, tokenizer, sample, provider)
+            return await _score_privileged_teacher_log_probs(args, tokenizer, sample, provider)
 
     teacher_log_probs = await asyncio.gather(*[_score(sample) for sample in samples])
     for sample, log_probs in zip(samples, teacher_log_probs, strict=True):
         sample.teacher_log_probs = log_probs
 
 
-def ensure_opsd_teacher_log_probs(args: Any, samples: list[Sample]) -> None:
-    """Fail early if an OPD run would reach training without teacher log-probs."""
-    if not opsd_enabled(args):
+async def annotate_zopd_teacher_log_probs(args: Any, tokenizer: Any, samples: list[Sample]) -> None:
+    """Populate ``Sample.teacher_log_probs`` for ALFWorld zOPD train samples."""
+    if not zopd_enabled(args) or not samples:
+        return
+
+    context = zopd_teacher_context()
+    if context == NORMAL_TEACHER_CONTEXT:
+        await annotate_normal_teacher_log_probs(args, samples)
+    else:
+        await annotate_privileged_teacher_log_probs(args, tokenizer, samples)
+
+
+def ensure_zopd_teacher_log_probs(args: Any, samples: list[Sample]) -> None:
+    """Fail early if a zOPD run would reach training without teacher log-probs."""
+    if not zopd_enabled(args):
         return
     for sample in samples:
         if sample.teacher_log_probs is not None:
@@ -280,6 +325,6 @@ def ensure_opsd_teacher_log_probs(args: Any, samples: list[Sample]) -> None:
             sample.teacher_log_probs = [0.0] * sample.response_length
             continue
         raise ValueError(
-            "ALFWorld OPSD requires teacher_log_probs for every non-empty train sample when "
+            "ALFWorld zOPD requires teacher_log_probs for every non-empty train sample when "
             f"--use-opd --opd-type {getattr(args, 'opd_type', None)} is enabled."
         )

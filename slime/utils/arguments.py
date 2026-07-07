@@ -1049,14 +1049,14 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--opd-type",
                 type=str,
-                choices=["sglang", "megatron", "self"],
+                choices=["sglang", "megatron", "zopd"],
                 default=None,
                 help=(
                     "Type of on-policy distillation. "
                     "'sglang': Teacher log-probs are obtained from external SGLang server during rollout. "
                     "'megatron': Teacher model is loaded via --opd-teacher-load and forwarded during training. "
-                    "'self': Teacher log-probs are supplied by a custom rollout path, usually by scoring "
-                    "the current rollout model/router under a privileged prompt."
+                    "'zopd': Teacher log-probs are supplied by a custom rollout path, for example a "
+                    "task-specific teacher context or router."
                 ),
             )
             parser.add_argument(
@@ -1727,7 +1727,7 @@ def slime_validate_args(args):
     if args.use_opd:
         if args.opd_type is None:
             raise ValueError(
-                "--opd-type must be specified when --use-opd is enabled. Choose 'sglang', 'megatron', or 'self'."
+                "--opd-type must be specified when --use-opd is enabled. Choose 'sglang', 'megatron', or 'zopd'."
             )
 
         if args.opd_type == "megatron":
@@ -1746,7 +1746,7 @@ def slime_validate_args(args):
                     "please make sure it is a valid megatron checkpoint directory."
                 )
 
-        elif args.opd_type in {"sglang", "self"}:
+        elif args.opd_type in {"sglang", "zopd"}:
             if args.opd_teacher_load is not None:
                 raise ValueError(
                     f"--opd-teacher-load should not be set when --opd-type={args.opd_type}. "
