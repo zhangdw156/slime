@@ -9,8 +9,8 @@ This script writes the fixed slime WebShop goal datasets used by the examples in
 this directory:
 
 * ``train.jsonl``: every training goal index in ``[train_start, goal_count)``;
-* ``valid.jsonl``: validation goal indices from the prefix of
-  ``[0, train_start)``;
+* ``valid.jsonl``: validation goal indices covering the full held-out prefix
+  ``[0, train_start)`` by default;
 * each row carries the WebShop goal seed needed to reproduce the service-side
   synthetic-goal ordering.
 """
@@ -72,7 +72,7 @@ def _build_slime_webshop_rows(
     """Build the static slime WebShop dataset.
 
     The default dataset uses ``env_seed=0``, training goals from
-    ``range(500, goal_count)``, and validation goals from ``range(100)``. The
+    ``range(500, goal_count)``, and validation goals from ``range(500)``. The
     dataset is independent of ``NUM_ROLLOUT`` and ``ROLLOUT_BATCH_SIZE``; those
     knobs only control how long/how broadly training iterates over this fixed
     dataset.
@@ -114,7 +114,7 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--env-seed", type=int, default=0, help="WebShop goal-order seed.")
     parser.add_argument("--train-start", type=int, default=500, help="First train goal index; lower indices are validation goals.")
-    parser.add_argument("--valid-size", type=int, default=100, help="Number of validation goals to materialize.")
+    parser.add_argument("--valid-size", type=int, default=500, help="Number of validation goals to materialize; default covers the full held-out prefix [0, train_start).")
     return parser.parse_args()
 
 

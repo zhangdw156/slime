@@ -52,21 +52,21 @@ class WebShopPrepareDataTest(unittest.TestCase):
         self.assertNotIn("total_rollouts", source)
         self.assertNotIn("train_batch_size", source)
 
-    def test_default_schedule_uses_full_train_pool_and_first_100_goals_for_validation(self):
+    def test_default_schedule_uses_full_train_pool_and_full_heldout_validation(self):
         args = Namespace(
             env_seed=0,
             train_start=500,
-            valid_size=100,
+            valid_size=500,
         )
 
         train_rows, valid_rows, summary = _build_slime_webshop_rows(args, goal_count=6910)
 
-        self.assertEqual(summary["schedule"]["valid_size"], 100)
+        self.assertEqual(summary["schedule"]["valid_size"], 500)
         self.assertEqual(summary["splits"]["train"]["count"], 6410)
-        self.assertEqual(summary["splits"]["valid"]["count"], 100)
+        self.assertEqual(summary["splits"]["valid"]["count"], 500)
         self.assertEqual([row["metadata"]["goal_idx"] for row in train_rows[:3]], [500, 501, 502])
         self.assertEqual([row["metadata"]["goal_idx"] for row in train_rows[-3:]], [6907, 6908, 6909])
-        self.assertEqual([row["metadata"]["goal_idx"] for row in valid_rows], list(range(100)))
+        self.assertEqual([row["metadata"]["goal_idx"] for row in valid_rows], list(range(500)))
         self.assertEqual({row["metadata"]["goal_seed"] for row in train_rows}, {0})
         self.assertNotIn("rollout_id", train_rows[0]["metadata"])
         self.assertNotIn("env_id", train_rows[0]["metadata"])
@@ -95,23 +95,9 @@ class WebShopPrepareDataTest(unittest.TestCase):
             summary = json.loads((output_dir / "summary.json").read_text(encoding="utf-8"))
 
         self.assertEqual(len(train_rows), 6410)
-        self.assertEqual(len(valid_rows), 100)
+        self.assertEqual(len(valid_rows), 500)
         self.assertEqual(summary["splits"]["train"]["count"], 6410)
-
-    def test_webshop_full_valid_eval_script_exists_and_uses_eval_only_path(self):
-        script = Path("examples/webshop/eval_qwen2.5_3B_instruct_full_valid.sh")
-        text = script.read_text(encoding="utf-8")
-
-        self.assertIn("--num-rollout 0", text)
-        self.assertIn("--eval-interval 1", text)
-        self.assertIn("--eval-prompt-data valid_full", text)
-        self.assertIn("WEBSHOP_FULL_EVAL_TASK_DIR", text)
-        self.assertIn("--valid-size 500", text)
-        self.assertIn("CKPT_STEP", text)
-        self.assertIn("--ckpt-step", text)
-        self.assertNotIn("WEBSHOP_TASK_DIR", text)
-        self.assertNotIn("--train-batch-size", text)
-        self.assertNotIn("--total-rollouts", text)
+        self.assertEqual(summary["splits"]["valid"]["count"], 500)
 
 
 if __name__ == "__main__":

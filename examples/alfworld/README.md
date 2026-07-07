@@ -4,7 +4,7 @@ This example trains `Qwen2.5-3B-Instruct` with slime GRPO in the ALFWorld TextWo
 
 The GRPO script is intended to reproduce the ALFWorld GRPO experiment from the SDAR paper [Self-Distilled Agentic Reinforcement Learning](https://arxiv.org/abs/2605.15155) by Meituan and Zhejiang University. The GRPO+OPSD script keeps the same ALFWorld rollout and reward path, but when `--use-opd --opd-type self` is enabled it scores each student step response under SDAR-style privileged ALFWorld skills on the current rollout SGLang router and passes `teacher_log_probs` to slime's existing OPD machinery. The pure OPSD script uses the same teacher-logprob path but sets processed training rewards to `0.0`, so the OPD term is the policy signal.
 
-Unless a launcher or experiment note explicitly marks an ablation/comparison setting, every experiment under `examples/alfworld` uses `ALFWORLD_HISTORY_LENGTH=4` by default. Keep `ALFWORLD_HISTORY_LENGTH=4` for standard training, SFT, OPD/OPSD, and full-valid evaluation runs; use another value only for intentionally named history-length ablations.
+Unless a launcher or experiment note explicitly marks an ablation/comparison setting, every experiment under `examples/alfworld` uses `ALFWORLD_HISTORY_LENGTH=4` by default. Keep `ALFWORLD_HISTORY_LENGTH=4` for standard training, SFT, OPD/OPSD, and evaluation runs; use another value only for intentionally named history-length ablations.
 
 ## 1. Environment setup
 
@@ -52,9 +52,7 @@ export ALFWORLD_DATA=${ALFWORLD_DATA:-/root/.cache/alfworld}
 python examples/alfworld/prepare_alfworld_data.py \
   --alfworld-data "$ALFWORLD_DATA" \
   --local-dir /root/slime-alfworld \
-  --train-size -1 \
-  --valid-seen-size 32 \
-  --valid-unseen-size 32
+  --train-size -1
 ```
 
 The output files are:
@@ -65,7 +63,7 @@ The output files are:
 /root/slime-alfworld/valid_unseen_games.jsonl
 ```
 
-Each row stores an `index` prompt plus `metadata.gamefile`; the rollout function uses the gamefile to load the actual ALFWorld episode.
+Each row stores an `index` prompt plus `metadata.gamefile`; the rollout function uses the gamefile to load the actual ALFWorld episode. By default, `prepare_alfworld_data.py` keeps all train, `valid_seen`, and `valid_unseen` games (`-1` means no truncation), so the training launchers evaluate on the full validation indices in `ALFWORLD_TASK_DIR`.
 
 ## 4. Run GRPO, GRPO+OPSD, or pure OPSD
 
@@ -212,62 +210,6 @@ ALFWorld rewards for metrics but returns zero processed training rewards, so
 the policy signal is the native OPD term. Unlike the `_opsd.sh` launchers, this
 path does not prepend ALFWorld privileged skill text to the teacher prompt.
 
-## 6. Run full valid_seen / valid_unseen evaluation only
-
-Use the full-valid eval launcher when training-time eval used a small exported
-subset, such as 32 seen and 32 unseen games, but you want to score a saved
-checkpoint on the full ALFWorld `valid_seen` and `valid_unseen` splits. The
-launcher regenerates separate full-eval JSONL indices from `$ALFWORLD_DATA` and
-does not overwrite the training/eval files under `ALFWORLD_TASK_DIR`.
-
-```bash
-cd /root/slime
-MODEL_ROOT=/root/Qwen2.5-3B-Instruct \
-SLIME_CKPT=/root/Qwen2.5-3B-Instruct_alfworld_grpo_slime \
-ALFWORLD_DATA=/root/.cache/alfworld \
-ALFWORLD_FULL_EVAL_TASK_DIR=/root/slime-alfworld-full-eval \
-bash examples/alfworld/eval_qwen2.5_3B_instruct_full_valid.sh
-```
-
-By default the script loads the latest checkpoint recorded by
-`latest_checkpointed_iteration.txt`. To evaluate a specific saved checkpoint,
-set `CKPT_STEP`; for example, `CKPT_STEP=50` loads `iter_0000050` from
-`SLIME_CKPT`:
-
-```bash
-CKPT_STEP=50 \
-SLIME_CKPT=/root/Qwen2.5-3B-Instruct_alfworld_grpo_slime \
-bash examples/alfworld/eval_qwen2.5_3B_instruct_full_valid.sh
-```
-
-The script runs slime in eval-only mode with `--num-rollout 0` and
-`--eval-interval 1`, so it initializes the model and rollout servers, syncs the
-selected checkpoint to SGLang, runs one full evaluation, and exits without
-training. Metrics are logged under names such as
-`eval/valid_seen_full/alfworld/success_rate` and
-`eval/valid_unseen_full/alfworld/success_rate`. SwanLab logging is enabled by
-default, matching the training launchers; set `USE_SWANLAB=0` to disable it,
-`USE_WANDB=1` to enable W&B, or `USE_TENSORBOARD=1` to enable TensorBoard.
-
-For post-training checkpoint sweeps, use `eval_all_checkpoints_full_valid.sh`.
-It scans `SLIME_CKPT/iter_*`, evaluates each saved checkpoint on the same full
-valid splits, and logs all results into one SwanLab run with the checkpoint step
-as the tracker step. Reuse the printed `SWEEP_ID` to resume a partially finished
-sweep without mixing it with a new experiment.
-
-For a Qwen2.5-0.5B SFT checkpoint sweep, override the model-args script and
-checkpoint roots while keeping the standard `ALFWORLD_HISTORY_LENGTH=4`. The
-SwanLab group, experiment name, and sweep-id prefix are derived from
-`MODEL_ARGS_SCRIPT` unless explicitly overridden:
-
-```bash
-cd /root/slime
-MODEL_ARGS_SCRIPT=qwen2.5-0.5B.sh \
-MODEL_ROOT=/root/Qwen2.5-0.5B-Instruct \
-MCORE_CKPT=/root/Qwen2.5-0.5B-Instruct_torch_dist \
-SLIME_CKPT=/root/Qwen2.5-0.5B-Instruct_alfworld_sft_slime \
-bash examples/alfworld/eval_all_checkpoints_full_valid.sh
-```
 
 ## Docker executable entrypoints
 
@@ -285,8 +227,6 @@ be overridden with environment variables shown above.
 | `build_sft_from_teacher_trajectories.py` | `python examples/alfworld/build_sft_from_teacher_trajectories.py --input /root/slime-alfworld-teacher-sft/all_trajectories.jsonl --output /root/slime-alfworld-teacher-sft/alfworld_teacher_sft.jsonl` | collected teacher trajectories | messages-format SFT JSONL |
 | `run_qwen2.5_0.5B_instruct_sft.sh` | `bash examples/alfworld/run_qwen2.5_0.5B_instruct_sft.sh` | 0.5B HF + torch_dist checkpoints and SFT JSONL | SFT student checkpoint; optional ALFWorld eval when `USE_EVAL=1` |
 | `run_qwen2.5_0.5B_instruct_opd_from_3B.sh` | `bash examples/alfworld/run_qwen2.5_0.5B_instruct_opd_from_3B.sh` | 0.5B HF + torch_dist checkpoints, prepared game indices, trained 3B SGLang `/generate` endpoint | Native slime OPD training of the 0.5B student from the 3B teacher |
-| `eval_qwen2.5_3B_instruct_full_valid.sh` | `bash examples/alfworld/eval_qwen2.5_3B_instruct_full_valid.sh` | trained 3B slime checkpoint and full ALFWorld data | full `valid_seen` / `valid_unseen` metrics |
-| `eval_all_checkpoints_full_valid.sh` | `bash examples/alfworld/eval_all_checkpoints_full_valid.sh` | trained slime checkpoint root with `iter_*` saves and full ALFWorld data | one SwanLab run containing full-valid metrics for every checkpoint step |
 
 The remaining Python files in this directory (`batched_rollout.py`,
 `generate_with_alfworld.py`, `opsd.py`, `alfworld_env.py`, and `prompts.py`) are
@@ -314,9 +254,6 @@ imported by the entrypoints above rather than launched directly.
 | `run_qwen2.5_3B_instruct_opsd.sh` | pure OPSD launcher with zero processed rewards and no GRPO reward-std filter |
 | `run_qwen2.5_0.5B_instruct_sft.sh` | SFT launcher for distilling 3B teacher ALFWorld data into Qwen2.5-0.5B-Instruct |
 | `run_qwen2.5_0.5B_instruct_opd_from_3B.sh` | native slime OPD launcher for online ALFWorld 0.5B rollouts scored by a trained 3B SGLang teacher |
-| `eval_qwen2.5_3B_instruct_full_valid.sh` | eval-only launcher that regenerates full valid_seen/valid_unseen indices and logs full-split metrics |
-| `eval_all_checkpoints_full_valid.sh` | eval-only checkpoint sweep launcher that logs every `iter_*` full-valid result into one SwanLab run |
-| `checkpoint_eval_logger.py` | custom eval logger that uses checkpoint step as the SwanLab/TensorBoard step |
 | `collect_teacher_trajectories.py` | collects all teacher trajectory attempts from a running 3B teacher endpoint |
 | `build_sft_from_teacher_trajectories.py` | filters successful teacher trajectories into messages-format SFT data |
 | `batched_rollout.py` | custom batched ALFWorld rollout function used by `--rollout-function-path` |
