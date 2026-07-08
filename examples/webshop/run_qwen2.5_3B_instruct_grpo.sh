@@ -110,6 +110,7 @@ ROLLOUT_ARGS=(
    --n-samples-per-prompt "${N_SAMPLES_PER_PROMPT}"
    --rollout-temperature 1
    --global-batch-size "${GLOBAL_BATCH_SIZE}"
+   --dynamic-sampling-filter-path generate_with_webshop.check_episode_reward_nonzero_std
    --custom-reward-post-process-path generate_with_webshop.grpo_normalize_webshop_steps
    --custom-rollout-log-function-path generate_with_webshop.log_webshop_rollout
    --balance-data
