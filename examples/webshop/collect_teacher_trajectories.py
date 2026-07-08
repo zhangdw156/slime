@@ -40,7 +40,6 @@ DEFAULT_MAX_STEPS = 15
 DEFAULT_SAMPLES_PER_TASK = 8
 DEFAULT_HISTORY_LENGTH = 4
 DEFAULT_STEP_MAX_TOKENS = 512
-DEFAULT_MAX_PROMPT_CHARS = 13000
 DEFAULT_INVALID_ACTION_PENALTY = 0.01
 DEFAULT_REWARD_MODE = "dense"
 SUPPORTED_REWARD_MODES = {"binary", "dense"}
@@ -315,7 +314,6 @@ def _build_step_prompt(
     available_actions: dict[str, Any],
     history: list[dict[str, str]],
     history_length: int,
-    max_prompt_chars: int,
 ) -> tuple[str, str, list[int], int]:
     user_prompt, history_used = build_observation_prompt(
         instruction_text=instruction_text,
@@ -323,7 +321,6 @@ def _build_step_prompt(
         available_actions=available_actions,
         history=history,
         history_length=history_length,
-        max_prompt_chars=max_prompt_chars,
     )
     prompt_text = _apply_chat_template(
         tokenizer,
@@ -409,7 +406,6 @@ def _make_initial_trajectory(args: argparse.Namespace, task: SamplingTask, sessi
         "max_steps": args.max_steps,
         "history_length": args.history_length,
         "step_max_tokens": args.step_max_tokens,
-        "max_prompt_chars": args.max_prompt_chars,
         "sampling_params": {
             "temperature": args.temperature,
             "top_p": args.top_p,
@@ -599,7 +595,6 @@ async def collect_one_trajectory(client: Any, tokenizer: Any, args: argparse.Nam
                 available_actions=available_actions,
                 history=history,
                 history_length=args.history_length,
-                max_prompt_chars=args.max_prompt_chars,
             )
             output = await _generate_one_step(
                 client,
@@ -760,7 +755,6 @@ def _summarize(counters: Counter[str], elapsed_sec: float, args: argparse.Namesp
             "max_steps": args.max_steps,
             "history_length": args.history_length,
             "step_max_tokens": args.step_max_tokens,
-            "max_prompt_chars": args.max_prompt_chars,
             "temperature": args.temperature,
             "top_p": args.top_p,
             "top_k": args.top_k,
@@ -857,7 +851,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-steps", type=int, default=int(os.environ.get("WEBSHOP_MAX_STEPS", DEFAULT_MAX_STEPS)))
     parser.add_argument("--history-length", type=int, default=int(os.environ.get("WEBSHOP_HISTORY_LENGTH", DEFAULT_HISTORY_LENGTH)))
     parser.add_argument("--step-max-tokens", type=int, default=int(os.environ.get("WEBSHOP_STEP_MAX_TOKENS", DEFAULT_STEP_MAX_TOKENS)))
-    parser.add_argument("--max-prompt-chars", type=int, default=int(os.environ.get("WEBSHOP_MAX_PROMPT_CHARS", DEFAULT_MAX_PROMPT_CHARS)))
     parser.add_argument("--invalid-action-penalty", type=float, default=float(os.environ.get("WEBSHOP_INVALID_ACTION_PENALTY", DEFAULT_INVALID_ACTION_PENALTY)))
     parser.add_argument("--reward-mode", default=os.environ.get("WEBSHOP_REWARD_MODE", DEFAULT_REWARD_MODE))
     parser.add_argument("--temperature", type=float, default=float(os.environ.get("TEMPERATURE", 0.7)))
@@ -884,8 +877,6 @@ def parse_args() -> argparse.Namespace:
         parser.error("--max-steps must be positive")
     if args.step_max_tokens <= 0:
         parser.error("--step-max-tokens must be positive")
-    if args.max_prompt_chars < 0:
-        parser.error("--max-prompt-chars must be non-negative")
     if args.invalid_action_penalty < 0:
         parser.error("--invalid-action-penalty must be non-negative")
     if args.fsync_every < 0:

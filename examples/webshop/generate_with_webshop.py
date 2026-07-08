@@ -32,7 +32,6 @@ logger = logging.getLogger(__name__)
 DEFAULT_MAX_STEPS = 15
 DEFAULT_HISTORY_LENGTH = 4
 DEFAULT_STEP_MAX_TOKENS = 512
-DEFAULT_MAX_PROMPT_CHARS = 13000
 DEFAULT_INVALID_ACTION_PENALTY = 0.01
 DEFAULT_REWARD_MODE = "dense"
 SUPPORTED_REWARD_MODES = {"binary", "dense"}
@@ -83,7 +82,6 @@ def _build_step_prompt(
     available_actions: dict,
     history: list[dict[str, str]],
     history_length: int,
-    max_prompt_chars: int,
 ) -> tuple[str, list[int], int]:
     user_prompt, prompt_history_used = build_observation_prompt(
         instruction_text=instruction_text,
@@ -91,7 +89,6 @@ def _build_step_prompt(
         available_actions=available_actions,
         history=history,
         history_length=history_length,
-        max_prompt_chars=max_prompt_chars,
     )
     messages = [
         {"role": "system", "content": WEBSHOP_SYSTEM_PROMPT},
@@ -260,7 +257,6 @@ async def generate(
     max_steps = DEFAULT_MAX_STEPS
     history_length = _get_int_env("WEBSHOP_HISTORY_LENGTH", DEFAULT_HISTORY_LENGTH)
     step_max_tokens = DEFAULT_STEP_MAX_TOKENS
-    max_prompt_chars = DEFAULT_MAX_PROMPT_CHARS
     invalid_action_penalty = DEFAULT_INVALID_ACTION_PENALTY
     reward_mode = _get_reward_mode()
 
@@ -302,7 +298,6 @@ async def generate(
                 available_actions=available_actions,
                 history=history,
                 history_length=history_length,
-                max_prompt_chars=max_prompt_chars,
             )
             output = await post(
                 sglang_url,

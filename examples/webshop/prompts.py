@@ -98,7 +98,6 @@ def build_observation_prompt(
     available_actions: dict,
     history: list[dict[str, str]] | None = None,
     history_length: int = 4,
-    max_prompt_chars: int = 12000,
 ) -> tuple[str, int]:
     history = history or []
     recent_history = history[-history_length:] if history_length > 0 else []
@@ -130,14 +129,6 @@ def build_observation_prompt(
         available_actions=formatted_actions,
         search_guidance=WEBSHOP_SEARCH_GUIDANCE,
     )
-    if max_prompt_chars > 0 and len(prompt) > max_prompt_chars:
-        prompt = WEBSHOP_TEMPLATE_NO_HIS.format(
-            instruction_text=instruction_text,
-            current_observation=current_observation,
-            available_actions=formatted_actions,
-            search_guidance=WEBSHOP_SEARCH_GUIDANCE,
-        )
-        return prompt, 0
     return prompt, len(recent_history)
 
 
