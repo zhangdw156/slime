@@ -116,7 +116,8 @@ EVAL_ARGS=(
    --eval-prompt-data valid_seen "${ALFWORLD_TASK_DIR}/valid_seen_games.jsonl" valid_unseen "${ALFWORLD_TASK_DIR}/valid_unseen_games.jsonl"
    --n-samples-per-eval-prompt 1
    --eval-max-response-len "${ALFWORLD_STEP_MAX_TOKENS}"
-   --eval-top-k 1
+   --eval-temperature 0.4
+   --eval-top-p 1.0
 )
 
 PERF_ARGS=(

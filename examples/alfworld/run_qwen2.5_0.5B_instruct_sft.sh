@@ -129,7 +129,8 @@ if [[ "${USE_EVAL}" == "1" ]]; then
       --eval-prompt-data valid_seen "${ALFWORLD_TASK_DIR}/valid_seen_games.jsonl" valid_unseen "${ALFWORLD_TASK_DIR}/valid_unseen_games.jsonl"
       --n-samples-per-eval-prompt 1
       --eval-max-response-len "${ALFWORLD_STEP_MAX_TOKENS}"
-      --eval-top-k 1
+      --eval-temperature 0.4
+      --eval-top-p 1.0
    )
    SGLANG_ARGS=(
       --rollout-num-gpus "${NUM_GPUS}"
