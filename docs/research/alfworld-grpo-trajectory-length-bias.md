@@ -3,7 +3,7 @@
 **slime 与 verl-agent 的机制差异、数值例子与论文研究假设**
 
 > 状态：内部研究备忘录
-> 日期：2026-07-10
+> 日期：2026-07-11
 > 对比提交：
 > - slime 开发分支：[feat/astra-v0.3.0](https://github.com/zhangdw156/slime/tree/feat/astra-v0.3.0)
 > - slime 固定快照：[21edc006b06cd93b7f6d59bdcb3cd15da1d1fc1b](https://github.com/zhangdw156/slime/tree/21edc006b06cd93b7f6d59bdcb3cd15da1d1fc1b)
@@ -27,10 +27,219 @@ slime 和 verl-agent 都会将一条 ALFWorld 多步轨迹展开为多个 step-l
 1. verl-agent 在训练前期可能凭借稀有成功 step 的高正向 advantage，以及每个外层训练 step 内更多的 Adam updates，实现更快的初始提升。
 2. 长失败轨迹在 verl-agent 中会带来更密集的负向状态覆盖和更严重的 outcome-level 错误 credit assignment，可能使合理的中间动作也被反复压低，最终更早达到平台。
 3. slime 的更新更保守，但 trajectory-level 等权使训练目标更接近 episode success rate，并限制轨迹长度导致的重复权重，可能带来更高的后期上限。
-4. slime 当前启用的动态后过滤会丢弃 reward 零方差的 prompt groups，形成在线困难样本筛选；它可能降低前期 wall-clock 效率，但提高后期有效训练信号和最终上限。
+4. slime 当前启用的动态后过滤会拒绝 reward std 不超过阈值的 prompt groups 并继续补采样；当这类 groups 与训练阶段或任务难度相关时，它可能影响前期 wall-clock 效率和后期有效训练信号。
 5. trajectory-level penalty 与 post-penalty dynamic filtering 会保留 task outcome 相同但 invalid count 不同的 groups，可能在全失败阶段和普遍成功阶段继续提供行为质量信号。
 
 这些机制共同构成一个值得系统验证的研究方向：**多步 agentic GRPO 的统计单位和优化单位应当是 step、token，还是 trajectory？**
+
+## 五机制统一框架
+
+当前 slime ALFWorld GRPO 可以被定义为一个由五项机制组成的
+trajectory-aware GRPO stack：
+
+```text
+trajectory penalty
++ trajectory advantage
++ trajectory reducer
++ group scheduler
++ penalty-aware dynamic filter
+```
+
+与当前 verl-agent native GRPO 的对应关系为：
+
+| 机制 | slime | verl-agent |
+|---|---|---|
+| M1 Penalty | trajectory invalid count 进入 final reward | invalid step 修改当前 raw score，advantage 组耦合 |
+| M2 Advantage | 按唯一 trajectories 计算 mean/std | 按展开后的 step rows 计算 mean/std |
+| M3 Reducer | 每条 trajectory 先形成一个 token mean | mini-batch 内直接 token mean |
+| M4 Scheduler | 按 trajectory groups 决定 optimizer updates | 按 flattened rows 切 optimizer mini-batches |
+| M5 Dynamic filter | 按 post-penalty trajectory reward 方差过滤 | 当前 native launcher 默认关闭 |
+
+这五项机制又可以分成三个层次：
+
+```text
+学习信号构造：
+  M1 trajectory penalty
+  M2 trajectory advantage
+
+梯度优化：
+  M3 trajectory reducer
+  M4 group scheduler
+
+数据选择：
+  M5 penalty-aware dynamic filter
+```
+
+三种角色、四个统计层和五项机制的关系如下：
+
+| 机制 | 机制角色 | 对应统计层 | 说明 |
+|---|---|---|---|
+| M1 Penalty | 学习信号构造 | Episode reward | 决定 invalid 信号如何进入 processed reward |
+| M2 Advantage | 学习信号构造 | Scalar advantage | 决定 mean/std 的统计单位 |
+| M3 Reducer | 梯度优化 | Token-level loss reduction | 决定长短 trajectory 在单次 update 中的相对权重 |
+| M4 Scheduler | 梯度优化 | Optimizer update schedule | 决定一次 rollout 产生多少次参数更新 |
+| M5 Dynamic filter | 数据选择 | Accepted-data selection | 在 M1 reward shaping 后、M2 advantage 前决定哪些 groups 进入后续计算 |
+
+其中“四个统计层”描述从 reward 到 optimizer 的计算链路。M5 在 M1 已经
+产生 post-penalty final reward 后执行，决定哪些 groups 继续进入 M2
+advantage、M3 reducer 和 M4 scheduler。因此，“四个统计层”和“五项机制”
+并不矛盾。
+
+### M1：Trajectory penalty
+
+slime 使用：
+
+$$
+\tilde R_\tau=Y_\tau-0.01K_\tau
+$$
+
+其中 \(K_\tau\) 为整条 trajectory 的 invalid action 总数。一个 invalid
+会降低整条 trajectory 的 final reward，并让该 trajectory 的所有 steps
+共享相应 advantage。
+
+verl-agent 仅在 invalid step raw score 上减去 `0.1`：
+
+$$
+\tilde r_{\tau,s}=10Y_\tau-0.1I_{\tau,s}
+$$
+
+但该 raw-score 修改会改变 `uid` group 的 mean/std，因此最终 advantage
+仍然是组耦合的。
+
+直观例子：8 条 trajectories 全部失败且
+`K=[0,1,2,3,4,5,6,7]` 时，slime 会按整条 trajectory invalid count
+排序；verl-agent 则会强烈惩罚具体 invalid rows，并轻微奖励其余 valid
+rows。详细计算见第 10.4 节。
+
+### M2：Trajectory advantage
+
+在核心 8-rollout 例子中：
+
+```text
+成功 trajectories：长度 10、11、14
+失败 trajectories：5 条，每条长度 50
+```
+
+slime 按 8 条 trajectories 计算：
+
+```text
+成功 advantage = +1.207612
+失败 advantage = -0.724567
+```
+
+verl-agent 按 285 个 step rows 计算：
+
+```text
+成功 step advantage = +2.667919
+失败 step advantage = -0.373509
+```
+
+因此，verl-agent 中稀有的成功 steps 获得更高的正向 advantage，而大量
+失败 steps 各自获得较小的负向 advantage。详细推导见第 5 节。
+
+### M3：Trajectory reducer
+
+Reducer 决定**一次 optimizer update 内每条 trajectory 占多大权重**。
+
+假设：
+
+```text
+Trajectory A：两个 token losses = [2, 4]
+Trajectory B：一个 token loss = [10]
+```
+
+verl-agent token mean：
+
+$$
+L_{\text{verl}}=\frac{2+4+10}{3}=5.33
+$$
+
+此时 A 因 token 数更多，占有 `2/3` 的 token positions。
+
+slime trajectory reducer：
+
+$$
+L_A=\frac{2+4}{2}=3,\qquad L_B=10
+$$
+
+$$
+L_{\text{slime}}=\frac{L_A+L_B}{2}=6.5
+$$
+
+此时 A 和 B 在外层各占一条 trajectory 的权重。
+
+Reducer 的长度加权机制是确定存在的，但其最终性能影响和方向并不确定。
+GRPO advantage magnitude 会部分反向补偿 step 数量，实际梯度还受到状态、
+动作、token 数、clipping 和 mini-batch 顺序影响，因此必须消融验证。
+
+### M4：Group scheduler
+
+Scheduler 决定**一次 rollout 最终执行多少次 `optimizer.step()`**。
+
+当前 slime launcher：
+
+```text
+16 prompts × 8 trajectories = 128 groups
+global_batch_size = 128 groups
+=> 1 optimizer.step
+```
+
+同样的轨迹分布在 verl-agent 中，如果完整 batch 展开为 4560 rows：
+
+```text
+4560 rows
+-> padding 到 4608
+-> 4608 / 256
+-> 18 optimizer steps
+```
+
+如果训练早期 128 条 trajectories 都运行到 50 步：
+
+```text
+128 × 50 / 256 = 25 optimizer steps
+```
+
+因此，scheduler 是解释 verl-agent 按 tracker/global step 观察时前期
+收敛更快的最强候选机制。slime 虽然也运行很多 microbatches，但会先累积
+所有 group gradients，再统一执行一次 optimizer update。
+
+### M5：Penalty-aware dynamic filter
+
+slime 当前使用 post-penalty trajectory final reward 做 nonzero-std
+filter：
+
+```text
+trajectory penalty
+-> final reward variance
+-> dynamic filter
+-> accepted prompt groups
+```
+
+它会：
+
+- 确定性地拒绝 final reward `std <= 1e-6` 的 groups；
+- 持续补采样，直到收集到目标数量的 `std > 1e-6` groups；
+- 保留 task outcome 相同但 invalid count 不同、因而 final reward 有差异
+  的 groups。
+
+如果零方差 groups 在训练前期大量出现，该机制可能增加 rollout/环境交互
+成本；如果零方差与后期已掌握任务相关，它可能表现为困难样本课程。但
+“零方差”等同于“简单样本”并不是代码事实，这些学习阶段解释仍属于待验证
+假设。该机制也可能产生选择偏差，因此需要与 trajectory penalty 做 2×2
+消融。
+
+### 当前机制假设
+
+当前最值得优先验证的假设是：
+
+| 现象 | 首要候选机制 | 其他候选机制 |
+|---|---|---|
+| verl-agent 前期提升更快 | M4 group scheduler | M2 step-row advantage |
+| slime 后期仍持续提升 | M5 dynamic filter | M1 trajectory penalty |
+| slime 最终上限更高 | M1 + M2 | M3 reducer + M5 filter |
+| 长失败轨迹的重复影响 | M2 + M3 + M4 | M1 penalty |
+
+这张表只是机制探索优先级，不是已经建立的因果结论。
 
 ---
 
@@ -672,7 +881,7 @@ Adam updates = 6400 / 256 = 25
 
 ### 8.1 verl-agent 为什么可能前期更快
 
-#### 机制 A：稀有成功 step 获得更大的正向 advantage
+#### 作用路径 A（主要关联 M2）：稀有成功 step 获得更大的正向 advantage
 
 在核心例子中：
 
@@ -683,13 +892,13 @@ verl-agent 成功 advantage = +2.667919
 
 早期只要偶然产生一条成功轨迹，其有限数量的成功 steps 就会得到非常强的正向更新，快速强化最先发现的成功行为。
 
-#### 机制 B：每个外层 step 内执行更多 Adam updates
+#### 作用路径 B（主要关联 M4）：每个外层 step 内执行更多 Adam updates
 
 在失败轨迹较长的训练前期，verl-agent 可能在一个 tracker/global step 内执行十几到二十多次 Adam updates，而 slime 当前 launcher 只执行一次。
 
 因此如果横轴使用外层 trainer/global step，二者并不是等优化预算比较。
 
-#### 机制 C：更小的 mini-batch 和更频繁的参数变化
+#### 作用路径 C（关联 M3/M4）：更小的 mini-batch 和更频繁的参数变化
 
 verl-agent 的模型参数会在不同 step-row mini-batches 之间发生变化，具有：
 
@@ -702,7 +911,7 @@ slime 则在一个较大的 trajectory-group batch 上先累积梯度，再统�
 
 ### 8.2 verl-agent 为什么可能更早达到平台
 
-#### 机制 D：长失败轨迹带来更广泛的负向状态覆盖
+#### 作用路径 D（关联 M2/M3/M4）：长失败轨迹带来更广泛的负向状态覆盖
 
 一条 50-step 失败轨迹的每个 step 都获得负 advantage。由于使用 outcome reward，这些 steps 中可能同时包含：
 
@@ -721,7 +930,7 @@ verl-agent 不使用 trajectory reducer，因此这些 steps 会被分散到更�
 - 模型过度拟合最先出现的少量成功模式；
 - 最终性能上限受限。
 
-#### 机制 E：优化目标是 step-weighted surrogate
+#### 作用路径 E（关联 M2/M3）：优化目标是 step-weighted surrogate
 
 最终任务指标通常是 episode success：
 
@@ -739,7 +948,7 @@ $$
 
 slime 按 trajectory 计算 advantage，并按 trajectory group 聚合 loss，因此其训练目标与 episode-level success 更一致。
 
-#### 机制 F：每个 global step 的实际更新次数随性能提高而下降
+#### 作用路径 F（主要关联 M4）：每个 global step 的实际更新次数随性能提高而下降
 
 训练前期失败轨迹长：
 
@@ -764,13 +973,13 @@ slime 的 optimizer update 数由 trajectory group 数决定，不随 trajectory
 
 ### 8.3 slime 为什么可能前期慢但上限高
 
-#### 机制 G：缺少极端正向 advantage spike
+#### 作用路径 G（主要关联 M2）：缺少极端正向 advantage spike
 
 trajectory-level normalization 不会因为成功 trajectory 较短就将其视为极少数 step rows，因此成功 advantage 通常没有 step-weighted normalization 那样极端。
 
 更新更加保守，可能导致较慢的初始提升。
 
-#### 机制 H：trajectory 总权重不随长度重复
+#### 作用路径 H（关联 M3/M4）：trajectory 总权重不随长度重复
 
 一条 50-step 失败 trajectory 和一条 10-step 成功 trajectory 在外层都只贡献一个 trajectory mean。
 
@@ -780,7 +989,7 @@ trajectory-level normalization 不会因为成功 trajectory 较短就将其视�
 - outcome reward 对合理中间动作的整体误伤；
 - 由轨迹长度产生的非平稳优化预算。
 
-#### 机制 I：更接近最终 episode-level 指标
+#### 作用路径 I（关联 M2/M3）：更接近最终 episode-level 指标
 
 每条 trajectory 等权的训练目标，与 ALFWorld success rate 的统计单位一致，更可能在长期优化中减少 surrogate-objective mismatch。
 
@@ -1168,7 +1377,7 @@ trajectory-level penalty
 相关代码：
 
 - slime launcher：[`examples/alfworld/run_qwen2.5_3B_instruct_grpo.sh:35-138`](https://github.com/zhangdw156/slime/blob/21edc006b06cd93b7f6d59bdcb3cd15da1d1fc1b/examples/alfworld/run_qwen2.5_3B_instruct_grpo.sh#L35-L138)
-- verl-agent launcher：[`../verl-agent/examples/grpo_trainer/run_alfworld.sh:21-84`](https://github.com/zhangdw156/verl-agent/blob/287d52e088675d7d5adb0bec621e1fb53b40d28b/examples/grpo_trainer/run_alfworld.sh#L21-L84)
+- verl-agent launcher：[`../verl-agent/examples/grpo_trainer/run_alfworld.sh:1-84`](https://github.com/zhangdw156/verl-agent/blob/287d52e088675d7d5adb0bec621e1fb53b40d28b/examples/grpo_trainer/run_alfworld.sh#L1-L84)
 - verl defaults：[`../verl-agent/verl/trainer/config/ppo_trainer.yaml:43-68`](https://github.com/zhangdw156/verl-agent/blob/287d52e088675d7d5adb0bec621e1fb53b40d28b/verl/trainer/config/ppo_trainer.yaml#L43-L68); [`../verl-agent/verl/trainer/config/ppo_trainer.yaml:234-257`](https://github.com/zhangdw156/verl-agent/blob/287d52e088675d7d5adb0bec621e1fb53b40d28b/verl/trainer/config/ppo_trainer.yaml#L234-L257); [`../verl-agent/verl/trainer/config/ppo_trainer.yaml:292-304`](https://github.com/zhangdw156/verl-agent/blob/287d52e088675d7d5adb0bec621e1fb53b40d28b/verl/trainer/config/ppo_trainer.yaml#L292-L304)
 - verl validation aggregation：[`../verl-agent/verl/trainer/ppo/ray_trainer.py:787-816`](https://github.com/zhangdw156/verl-agent/blob/287d52e088675d7d5adb0bec621e1fb53b40d28b/verl/trainer/ppo/ray_trainer.py#L787-L816)
 
@@ -1178,7 +1387,81 @@ trajectory-level penalty
 
 要把当前机制观察发展为论文结论，需要分离 advantage、loss reducer、optimizer schedule 和 dynamic filter。
 
-### 12.1 建议的核心 2×2×2 实验
+### 12.1 当前机制探索：verl-agent V0→V5 增量实验链
+
+当前阶段优先采用**在 verl-agent native baseline 上逐项增加机制**的探索
+方式，而不是立即追求完整 factorial。
+
+指定对照组（runtime manifest 待冻结）：
+
+V0 source = [`../verl-agent/examples/grpo_trainer/run_alfworld.sh:1-84`](https://github.com/zhangdw156/verl-agent/blob/287d52e088675d7d5adb0bec621e1fb53b40d28b/examples/grpo_trainer/run_alfworld.sh#L1-L84)
+
+V0 当前正在运行，不需要重新启动，但在 V1 开始前必须将本次 V0 的实际运行
+清单冻结下来。脚本接受首个 `ENGINE` 参数和末尾 `$@` overrides，仅固定脚本
+路径不足以完整复现运行状态。需要记录：
+
+| V0 运行字段 | 要求 |
+|---|---|
+| verl-agent commit | `287d52e088675d7d5adb0bec621e1fb53b40d28b` |
+| launcher | [`examples/grpo_trainer/run_alfworld.sh:1-84`](https://github.com/zhangdw156/verl-agent/blob/287d52e088675d7d5adb0bec621e1fb53b40d28b/examples/grpo_trainer/run_alfworld.sh#L1-L84) |
+| ENGINE | 记录实际值，例如 `vllm` |
+| `$@` overrides | 记录完整 Hydra overrides；若无则明确写 `none` |
+| 关键环境变量 | `ALFWORLD_DATA`、`PATH`、`LD_PRELOAD` 等 |
+| model path | 记录实际 checkpoint 路径 |
+| SwanLab run ID | 记录当前 baseline run ID |
+| 启动时间与服务器/GPU | 记录运行环境 |
+
+V0 并不是“没有机制”，而是使用五个机制在 verl-agent 中的 native 版本：
+
+```text
+M1 raw-score-local penalty
+M2 step-row advantage
+M3 token-mean reducer
+M4 row-based scheduler
+M5 dynamic filter off
+```
+
+后续五个版本会逐项将 native 机制替换为 trajectory-aware 版本，或启用
+slime 机制：
+
+| ID | 相比上一个版本的替换/启用 | 当前机制状态 | 主要问题 |
+|---|---|---|---|
+| V0 | native baseline | M1/M2/M3/M4 均为 native；M5 off | 原始 verl-agent GRPO 曲线 |
+| V1 | 将 M4 替换为 group scheduler | trajectory M4 | 多次 optimizer updates 是否解释前期快速收敛？ |
+| V2 | 将 M3 替换为 trajectory reducer | trajectory M3/M4 | 长短 trajectory 外层等权是否改变性能？ |
+| V3 | 将 M2 替换为 trajectory advantage | trajectory M2/M3/M4 | trajectory mean/std 是否改善学习信号？ |
+| V4 | 将 M1 替换为 trajectory penalty | trajectory M1/M2/M3/M4 | 连带惩罚是否改善全局行为质量？ |
+| V5 | 启用 M5 dynamic filter | trajectory M1～M5 | penalty-aware filtering 是否提高后期上限？ |
+
+该顺序满足两个依赖关系：
+
+1. trajectory reducer 放在 group scheduler 之后，避免同一 trajectory 的
+   steps 已经被拆进不同 optimizer updates；
+2. dynamic filter 放在 trajectory penalty 之后，使 V5 真正测试
+   post-penalty reward filtering。
+
+五个新增实验的直接比较为：
+
+```text
+V1 - V0 -> 将 M4 从 row-based 替换为 group scheduler 的增量作用
+V2 - V1 -> 将 M3 从 token mean 替换为 trajectory reducer 的增量作用
+V3 - V2 -> 将 M2 从 step-row 替换为 trajectory advantage 的增量作用
+V4 - V3 -> 将 M1 从 raw-score-local 替换为 trajectory penalty 的增量作用
+V5 - V4 -> 启用 M5 dynamic filter 的增量作用
+```
+
+这是一条顺序依赖的机制发现链，而不是最终的单变量因果证明。若某一步出现
+显著跃迁或退化，再围绕该机制补反向删除、交互组合或独立分支实验。
+
+当前 ALFWorld 阶段共形成：
+
+```text
+V0 已有 baseline
++ V1、V2、V3、V4、V5 五个新增实验
+= 6 个版本
+```
+
+### 12.2 后续受控核心 2×2×2 实验
 
 三个因素：
 
@@ -1199,7 +1482,7 @@ trajectory-level penalty
 
 总计 8 个实验设置。所有其他配置应保持一致。
 
-### 12.2 Penalty、validity 与 filter 的分阶段消融
+### 12.3 Penalty、validity 与 filter 的分阶段消融
 
 惩罚机制不适合直接与前述 2×2×2 全排列，因为会迅速形成过大的实验矩阵。
 建议先固定 advantage、reducer 和 optimizer schedule，再分阶段比较。
@@ -1285,7 +1568,7 @@ granularity，而不是惩罚总量。
 Native-ratio 与 calibrated-strength 两组结果都应保留：前者回答真实默认配置
 的差异，后者回答 penalty granularity 的独立因果作用。
 
-### 12.3 Optimizer-budget 对齐
+### 12.4 Optimizer-budget 对齐
 
 至少提供三种横轴：
 
@@ -1303,7 +1586,7 @@ Native-ratio 与 calibrated-strength 两组结果都应保留：前者回答真�
 - 固定总生成 token；
 - 固定 wall-clock。
 
-### 12.4 建议记录的指标
+### 12.5 建议记录的指标
 
 #### 轨迹级指标
 
@@ -1358,7 +1641,7 @@ Native-ratio 与 calibrated-strength 两组结果都应保留：前者回答真�
 - penalty 前后 trajectory 排序变化
 - penalty signal 与 task success signal 的梯度余弦
 
-### 12.5 离线反事实重放
+### 12.6 离线反事实重放
 
 对同一批已收集 trajectory，同时离线计算：
 
@@ -1588,7 +1871,7 @@ invalid step
 
 | 机制 | 路径 |
 |---|---|
-| ALFWorld launcher | [`../verl-agent/examples/grpo_trainer/run_alfworld.sh:21-84`](https://github.com/zhangdw156/verl-agent/blob/287d52e088675d7d5adb0bec621e1fb53b40d28b/examples/grpo_trainer/run_alfworld.sh#L21-L84) |
+| ALFWorld launcher | [`../verl-agent/examples/grpo_trainer/run_alfworld.sh:1-84`](https://github.com/zhangdw156/verl-agent/blob/287d52e088675d7d5adb0bec621e1fb53b40d28b/examples/grpo_trainer/run_alfworld.sh#L1-L84) |
 | uid/traj_uid 与 rollout | [`../verl-agent/agent_system/multi_turn_rollout/rollout_loop.py:285-414`](https://github.com/zhangdw156/verl-agent/blob/287d52e088675d7d5adb0bec621e1fb53b40d28b/agent_system/multi_turn_rollout/rollout_loop.py#L285-L414) |
 | step rows flatten | [`../verl-agent/agent_system/multi_turn_rollout/rollout_loop.py:233-283`](https://github.com/zhangdw156/verl-agent/blob/287d52e088675d7d5adb0bec621e1fb53b40d28b/agent_system/multi_turn_rollout/rollout_loop.py#L233-L283) |
 | episode reward manager | [`../verl-agent/agent_system/reward_manager/episode.py:39-79`](https://github.com/zhangdw156/verl-agent/blob/287d52e088675d7d5adb0bec621e1fb53b40d28b/agent_system/reward_manager/episode.py#L39-L79) |
@@ -1626,5 +1909,27 @@ invalid step
 2. slime 的 trajectory-aware 设计可能牺牲部分前期速度，但减少长度偏置和错误 credit 的重复权重，并可能因此获得更高后期上限。
 3. 动态后过滤可能通过困难样本筛选提高 slime 的长期学习效率和最终性能。
 4. trajectory-level collective penalty、admissible-aware validity 与 penalty-aware filtering 的组合可能是 slime 后期上限更高的另一项原因。
+
+### 17.3 当前机制探索目标
+
+下一阶段将在 verl-agent ALFWorld 3B baseline 上执行 V0→V5 累积增量链：
+
+```text
+V0 native M1/M2/M3/M4，M5 off
+-> V1 replace M4 with group scheduler
+-> V2 replace M3 with trajectory reducer
+-> V3 replace M2 with trajectory advantage
+-> V4 replace M1 with trajectory penalty
+-> V5 enable M5 dynamic filter
+```
+
+V0 为当前正在运行的指定对照组，但必须在 V1 启动前补齐第 12.1 节列出的
+runtime manifest，之后才能视为可复现的固定 baseline。后续新增 V1～V5
+五个实验。该阶段目标不是立即完成论文最终实验，而是定位：
+
+- 哪个机制主要改变前期收敛速度；
+- 哪个机制主要改变后期上限；
+- 哪些机制组合存在协同或冲突；
+- 是否可以找到比当前 slime full stack 更好的混合配置。
 
 下一步应通过 optimizer-budget 对齐、advantage/reducer、penalty granularity、validity checker、filter reward source 的独立消融和多随机种子实验，将上述机制解释提升为可发表的因果证据。
